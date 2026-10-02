@@ -13,11 +13,16 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -91,7 +96,14 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // The system constants live in the constants descriptor set; set 0 binding 0
+  // is the shared memory storage buffer. Declaring a uniform buffer there is a
+  // descriptor type mismatch (VUID-VkGraphicsPipelineCreateInfo-layout-07990)
+  // that makes AMD drivers fail pipeline creation with VK_ERROR_UNKNOWN as
+  // soon as any stage also reads the shared memory.
+  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -268,6 +280,46 @@ void main() {
 }
 )";
   return source;
+}
+
+// ROV research (rov-research branch): keep the GLSL and SPIR-V of the
+// runtime-compiled tessellation helper stages, so that a pipeline the driver
+// rejects can be dumped with all of its stages for offline checks (spirv-val,
+// RGA).
+struct DebugSpirv {
+  std::string glsl;
+  std::vector<uint32_t> spirv;
+};
+std::mutex& DebugSpirvMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+std::unordered_map<VkShaderModule, DebugSpirv>& DebugSpirvModules() {
+  static std::unordered_map<VkShaderModule, DebugSpirv> modules;
+  return modules;
+}
+void RememberDebugSpirv(VkShaderModule module, const std::string& glsl,
+                        const std::vector<uint32_t>& spirv) {
+  if (module == VK_NULL_HANDLE) {
+    return;
+  }
+  std::lock_guard lock(DebugSpirvMutex());
+  DebugSpirvModules()[module] = DebugSpirv{glsl, spirv};
+}
+void WriteDebugFile(const std::filesystem::path& path, const void* data, size_t size) {
+  std::ofstream file(path, std::ios::binary);
+  file.write(static_cast<const char*>(data), std::streamsize(size));
+}
+void WriteDebugModule(const std::filesystem::path& base, const char* stage, VkShaderModule module) {
+  std::lock_guard lock(DebugSpirvMutex());
+  auto it = DebugSpirvModules().find(module);
+  if (it == DebugSpirvModules().end()) {
+    return;
+  }
+  const DebugSpirv& debug = it->second;
+  WriteDebugFile(base.string() + "_" + stage + ".glsl", debug.glsl.data(), debug.glsl.size());
+  WriteDebugFile(base.string() + "_" + stage + ".spv", debug.spirv.data(),
+                 sizeof(uint32_t) * debug.spirv.size());
 }
 
 }  // namespace
@@ -1691,6 +1743,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(bool adaptive) {
         "shader module",
         adaptive ? "adaptive" : "indexed");
   }
+  RememberDebugSpirv(shader_module, source, shader_spirv);
   return shader_module;
 }
 
@@ -1745,6 +1798,7 @@ VkShaderModule VulkanPipelineCache::GetTessellationControlShader(
         "module 0x{:08X}",
         key.key);
   }
+  RememberDebugSpirv(shader_module, source, shader_spirv);
   tessellation_control_shaders_.emplace(key, shader_module);
   return shader_module;
 }
@@ -3102,6 +3156,172 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     shader_stage_vertex.pName = "main";
     shader_stage_vertex.pSpecializationInfo = nullptr;
   }
+  // ROV research: REX_VK_TESS_DEBUG bisects the AMD tessellation pipeline
+  // failure (vkCreateGraphicsPipelines -> VK_ERROR_UNKNOWN). Comma-separated:
+  //   tese  - trivial GLSL tessellation evaluation shader instead of the guest one
+  //   tesc  - trivial GLSL tessellation control shader instead of the helper
+  //   strip - guest TES without the SPV_KHR_float_controls modes
+  static const std::string tess_debug = [] {
+    const char* value = std::getenv("REX_VK_TESS_DEBUG");
+    return std::string(value ? value : "");
+  }();
+  if (tessellated && !tess_debug.empty()) {
+    static std::mutex tess_debug_mutex;
+    static std::unordered_map<uint64_t, VkShaderModule> tess_debug_modules;
+    std::lock_guard tess_debug_lock(tess_debug_mutex);
+    bool quads = creation_arguments.tessellation_patch_control_points == 4;
+    auto compile = [&](uint64_t key, VkShaderStageFlagBits stage,
+                       const std::string& source) -> VkShaderModule {
+      auto it = tess_debug_modules.find(key);
+      if (it != tess_debug_modules.end()) {
+        return it->second;
+      }
+      std::vector<uint32_t> spirv;
+      std::string error;
+      VkShaderModule module = VK_NULL_HANDLE;
+      if (command_processor_.CompileGlslToSpirv(stage, source, spirv, error)) {
+        module = ui::vulkan::util::CreateShaderModule(vulkan_device, spirv.data(),
+                                                      sizeof(uint32_t) * spirv.size());
+      } else {
+        REXGPU_ERROR("TESSDBG: GLSL compile failed: {}", error);
+      }
+      tess_debug_modules.emplace(key, module);
+      return module;
+    };
+    if (tess_debug.find("tese") != std::string::npos) {
+      // Optional features of the guest TES, to find the one the driver rejects:
+      // prim (gl_PrimitiveID), cull (gl_CullDistance), ubo (set 1 binding 0),
+      // ssbo (set 0 binding 0), tex (set 2 texture2DArray + sampler).
+      auto has = [&](const char* feature) { return tess_debug.find(feature) != std::string::npos; };
+      std::string source = "#version 450\n";
+      source += fmt::format("layout({}, fractional_even_spacing, cw) in;\n",
+                            quads ? "quads" : "triangles");
+      source += "layout(location = 0) patch in vec4 xe_in_patch_control_point_indices;\n";
+      if (has("ubo")) {
+        source += "layout(set = 1, binding = 0, std140) uniform XeSys { uint flags; } xe_sys;\n";
+      }
+      if (has("ssbo")) {
+        // ssbo_rw: without readonly / restrict.
+        source += fmt::format(
+            "layout(set = 0, binding = 0, std430) {}buffer XeShared {{ uint data[]; }} xe_shared;\n",
+            has("ssbo_rw") ? "" : "readonly restrict ");
+      }
+      if (has("tex")) {
+        source += "layout(set = 2, binding = 0) uniform texture2DArray xe_tex;\n";
+        source += "layout(set = 2, binding = 2) uniform sampler xe_smp;\n";
+      }
+      if (has("cull")) {
+        source += "out gl_PerVertex { vec4 gl_Position; float gl_CullDistance[1]; };\n";
+      }
+      source += "void main() {\n";
+      source +=
+          "  vec4 p = vec4(gl_TessCoord.xy, 0.5, 1.0 + 1e-30 * "
+          "xe_in_patch_control_point_indices.x);\n";
+      if (has("prim")) {
+        source += "  p.x += 1e-30 * float(gl_PrimitiveID);\n";
+      }
+      if (has("ubo")) {
+        source += "  p.y += 1e-30 * float(xe_sys.flags);\n";
+      }
+      if (has("ssbo")) {
+        // ssbo_c: constant index instead of a tessellation-coordinate one.
+        source += has("ssbo_c")
+                      ? "  p.z += 1e-30 * float(xe_shared.data[0]);\n"
+                      : "  p.z += 1e-30 * float(xe_shared.data[uint(gl_TessCoord.x * 7.0)]);\n";
+      }
+      if (has("tex")) {
+        source +=
+            "  p += 1e-30 * textureLod(sampler2DArray(xe_tex, xe_smp), "
+            "vec3(gl_TessCoord.xy, 0.0), 0.0);\n";
+      }
+      source += "  gl_Position = p;\n";
+      if (has("cull")) {
+        source += "  gl_CullDistance[0] = 1.0;\n";
+      }
+      source += "}\n";
+      VkShaderModule module = compile(std::hash<std::string>()(source),
+                                      VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, source);
+      if (module != VK_NULL_HANDLE) {
+        shader_stages[2].module = module;
+      }
+    } else if (tess_debug.find("strip") != std::string::npos) {
+      uint64_t key = uint64_t(uintptr_t(shader_stages[2].module));
+      auto it = tess_debug_modules.find(key);
+      if (it == tess_debug_modules.end()) {
+        const std::vector<uint8_t>& binary = creation_arguments.vertex_shader->translated_binary();
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(binary.data());
+        size_t word_count = binary.size() / sizeof(uint32_t);
+        std::vector<uint32_t> out(words, words + std::min<size_t>(word_count, 5));
+        for (size_t i = 5; i < word_count;) {
+          uint32_t length = words[i] >> 16;
+          uint32_t opcode = words[i] & 0xFFFF;
+          if (!length) {
+            break;
+          }
+          bool drop = false;
+          if (opcode == 17 && length >= 2) {  // OpCapability
+            drop = words[i + 1] >= 4464 && words[i + 1] <= 4468;
+          } else if (opcode == 16 && length >= 3) {  // OpExecutionMode
+            drop = words[i + 2] >= 4459 && words[i + 2] <= 4463;
+          }
+          if (!drop) {
+            out.insert(out.end(), words + i, words + std::min(word_count, i + length));
+          }
+          i += length;
+        }
+        VkShaderModule module = ui::vulkan::util::CreateShaderModule(
+            vulkan_device, out.data(), sizeof(uint32_t) * out.size());
+        it = tess_debug_modules.emplace(key, module).first;
+      }
+      if (it->second != VK_NULL_HANDLE) {
+        shader_stages[2].module = it->second;
+      }
+    }
+    const char* const kSharedMemoryGlsl =
+        "layout(set = 0, binding = 0, std430) readonly restrict buffer XeShared "
+        "{ uint data[]; } xe_shared;\n";
+    if (tess_debug.find("tesc") != std::string::npos) {
+      // kbuf: the TCS also reads the shared memory storage buffer.
+      bool kbuf = tess_debug.find("kbuf") != std::string::npos;
+      std::string source = "#version 450\n";
+      source += "layout(vertices = 1) out;\n";
+      source += "layout(location = 0) patch out vec4 xe_out_patch_control_point_indices;\n";
+      if (kbuf) {
+        source += kSharedMemoryGlsl;
+      }
+      source += "void main() {\n";
+      source += kbuf ? "  gl_TessLevelOuter[0] = 1.0 + 1e-30 * float(xe_shared.data[gl_PrimitiveID]);\n"
+                     : "  gl_TessLevelOuter[0] = 1.0;\n";
+      source +=
+          "  gl_TessLevelOuter[1] = 1.0;\n"
+          "  gl_TessLevelOuter[2] = 1.0;\n"
+          "  gl_TessLevelOuter[3] = 1.0;\n"
+          "  gl_TessLevelInner[0] = 1.0;\n"
+          "  gl_TessLevelInner[1] = 1.0;\n"
+          "  xe_out_patch_control_point_indices = vec4(0.0);\n"
+          "}\n";
+      VkShaderModule module = compile(std::hash<std::string>()(source),
+                                      VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, source);
+      if (module != VK_NULL_HANDLE) {
+        shader_stages[1].module = module;
+      }
+    }
+    if (tess_debug.find("vbuf") != std::string::npos) {
+      // vbuf: a helper vertex shader that reads the shared memory storage buffer.
+      std::string source = "#version 450\n";
+      source += "layout(location = 0) out float xe_out_value;\n";
+      source += kSharedMemoryGlsl;
+      source +=
+          "void main() {\n"
+          "  xe_out_value = 1.0 + 1e-30 * float(xe_shared.data[gl_VertexIndex]);\n"
+          "}\n";
+      VkShaderModule module = compile(std::hash<std::string>()(source), VK_SHADER_STAGE_VERTEX_BIT,
+                                      source);
+      if (module != VK_NULL_HANDLE) {
+        shader_stages[0].module = module;
+      }
+    }
+  }
   // Geometry shader.
   if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {
     if (tessellated) {
@@ -3495,7 +3715,52 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         uint32_t(description.tessellation_mode),
         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
         uint32_t(use_dynamic_rendering));
+    // ROV research: dump every stage of the first few distinct failures to
+    // vk_pipeline_fail/ next to the working directory.
+    {
+      static std::mutex dump_mutex;
+      static std::set<std::string> dumped;
+      std::string tag = fmt::format("{:016X}_{:016X}_t{}",
+                                    creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                                    ps_hash, uint32_t(description.tessellation_mode));
+      std::lock_guard dump_lock(dump_mutex);
+      if (dumped.size() < 16 && dumped.insert(tag).second) {
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::current_path(ec) / "vk_pipeline_fail";
+        std::filesystem::create_directories(dir, ec);
+        std::filesystem::path base = dir / tag;
+        const std::vector<uint8_t>& guest_vs = creation_arguments.vertex_shader->translated_binary();
+        WriteDebugFile(base.string() + (tessellated ? "_tese.spv" : "_vert.spv"), guest_vs.data(),
+                       guest_vs.size());
+        if (creation_arguments.pixel_shader) {
+          const std::vector<uint8_t>& ps = creation_arguments.pixel_shader->translated_binary();
+          WriteDebugFile(base.string() + "_frag.spv", ps.data(), ps.size());
+        }
+        if (tessellated) {
+          WriteDebugModule(base, "helper_vert", creation_arguments.tessellation_vertex_shader);
+          WriteDebugModule(base, "tesc", creation_arguments.tessellation_control_shader);
+        }
+        std::string info = fmt::format(
+            "result={}\ntopology={}\ngeometry={}\ntess_mode={}\npatch_control_points={}\n"
+            "render_pass_key=0x{:08X}\ndynamic_rendering={}\nfsi={}\nstage_count={}\n",
+            int32_t(create_result), uint32_t(description.primitive_topology),
+            uint32_t(description.geometry_shader), uint32_t(description.tessellation_mode),
+            creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
+            uint32_t(use_dynamic_rendering), uint32_t(edram_fragment_shader_interlock),
+            shader_stage_count);
+        WriteDebugFile(base.string() + "_info.txt", info.data(), info.size());
+        REXGPU_ERROR("VulkanPipelineCache: dumped the failing pipeline to {}", base.string());
+      }
+    }
     return false;
+  }
+  if (tessellated && !tess_debug.empty()) {
+    static std::atomic<int> tess_debug_ok_logged{0};
+    if (tess_debug_ok_logged++ < 8) {
+      REXGPU_INFO("TESSDBG {}: tessellated pipeline created (vs={:016X}, patch_cp={})", tess_debug,
+                  creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                  creation_arguments.tessellation_patch_control_points);
+    }
   }
   bool was_placeholder =
       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);

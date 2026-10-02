@@ -709,7 +709,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // 2x2 quads.
   bool FSI_IsDepthStencilEarly() const {
     assert_true(edram_fragment_shader_interlock_);
-    return !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
+    return !RovLateDepthDebug() && !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
            !current_shader().memexport_eM_written();
   }
   void FSI_LoadSampleMask(spv::Id msaa_samples);

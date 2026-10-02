@@ -707,7 +707,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // 2x2 quads.
   bool ROV_IsDepthStencilEarly() const {
     assert_true(edram_rov_used_);
-    return !is_depth_only_pixel_shader_ && !current_shader().writes_depth() &&
+    return !RovLateDepthDebug() && !is_depth_only_pixel_shader_ && !current_shader().writes_depth() &&
            !current_shader().memexport_eM_written();
   }
   // Converts the pre-clamped depth value to 24-bit (storing the result in bits

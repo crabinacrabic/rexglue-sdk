@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
@@ -23,6 +24,17 @@
 #include <rex/string/buffer.h>
 
 namespace rex::graphics {
+
+// ROV research: REX_ROV_LATE_DEPTH=1 forces the late (end of shader) EDRAM
+// depth / stencil test in the ROV and FSI paths, so the ordered section only
+// covers the tail of the pixel shader.
+inline bool RovLateDepthDebug() {
+  static const bool value = [] {
+    const char* env = std::getenv("REX_ROV_LATE_DEPTH");
+    return env && *env == '1';
+  }();
+  return value;
+}
 
 class ShaderTranslator {
  public:

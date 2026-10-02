@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -628,6 +629,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)
+    // ROV research: REX_VK_NO_ROBUST=1 turns robustBufferAccess off (AMD
+    // tessellation + storage buffer pipeline failure bisect).
+    if (const char* no_robust = std::getenv("REX_VK_NO_ROBUST"); no_robust && (*no_robust == '1' || *no_robust == '2')) {
+      enabled_features.robustBufferAccess = VK_FALSE;
+      device->properties_.robustBufferAccess = VK_FALSE;
+      REXLOG_WARN("REX_VK_NO_ROBUST: robustBufferAccess disabled");
+    }
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
     XE_UI_VULKAN_FEATURE(independentBlend)
     XE_UI_VULKAN_FEATURE(geometryShader)
@@ -728,6 +736,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_EXT_robustness2) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
+      if (const char* no_robust = std::getenv("REX_VK_NO_ROBUST"); no_robust && *no_robust == '2') {
+        features_EXT_robustness2.enabled.nullDescriptor = VK_FALSE;
+        device->properties_.nullDescriptor = VK_FALSE;
+        REXLOG_WARN("REX_VK_NO_ROBUST: nullDescriptor disabled");
+      }
     }
   }
 

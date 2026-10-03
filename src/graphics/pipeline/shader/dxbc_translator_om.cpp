@@ -1846,6 +1846,89 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   dxbc::Src temp_w_src(dxbc::Src::R(temp, dxbc::Src::kWWWW));
 
   uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+  uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
+  uint32_t edram_size_32bpp_samples = (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) *
+                                      tile_width * xenos::kEdramTileCount;
+
+  // ROV research (REX_ROV_HOIST): with the late depth / stencil test, the
+  // ordered section starts at the first EDRAM access in it. Prepare everything
+  // about the color that doesn't depend on the EDRAM contents before that, so
+  // the ordered section only contains the read-modify-write.
+  // hoisted_color_temps[i].xy = packed color if not blending, 0 if blending.
+  // hoisted_color_temps[i].z = EDRAM address of sample 0 of the render target.
+  uint32_t hoisted_color_temps[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  if (RovHoistDebug() && !ROV_IsDepthStencilEarly() && !is_depth_only_pixel_shader_) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (!(shader_writes_color_targets & (1 << i))) {
+        continue;
+      }
+      uint32_t hoisted = PushSystemTemp();
+      hoisted_color_temps[i] = hoisted;
+      a_.OpMul(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+               LoadSystemConstant(SystemConstants::Index::kColorExpBias,
+                                  offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
+                                  dxbc::Src::kXXXX));
+      dxbc::Src rt_format_flags_src(LoadSystemConstant(
+          SystemConstants::Index::kEdramRTFormatFlags,
+          offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i,
+          dxbc::Src::kXXXX));
+      a_.OpAnd(dxbc::Dest::R(hoisted, 0b0100), rt_format_flags_src,
+               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+      a_.OpMovC(dxbc::Dest::R(hoisted, 0b0100), dxbc::Src::R(hoisted, dxbc::Src::kZZZZ),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ));
+      a_.OpIAdd(dxbc::Dest::R(hoisted, 0b0100), dxbc::Src::R(hoisted, dxbc::Src::kZZZZ),
+                LoadSystemConstant(
+                    SystemConstants::Index::kEdramRTBaseDwordsScaled,
+                    offsetof(SystemConstants, edram_rt_base_dwords_scaled) + sizeof(uint32_t) * i,
+                    dxbc::Src::kXXXX));
+      a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(hoisted, 0b0100),
+                dxbc::Src::R(hoisted, dxbc::Src::kZZZZ), dxbc::Src::LU(edram_size_32bpp_samples));
+      dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
+          SystemConstants::Index::kEdramRTBlendFactorsOps,
+          offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
+          dxbc::Src::kXXXX));
+      dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
+          SystemConstants::Index::kEdramRTClamp,
+          offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
+      a_.OpIEq(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(0x00010001));
+      a_.OpIf(true, temp_x_src);
+      {
+        a_.OpMax(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+                 rt_clamp_vec_src.Swizzle(0b01000000));
+        a_.OpMin(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
+                 rt_clamp_vec_src.Swizzle(0b11101010));
+        ROV_PackPreClampedColor(i, system_temps_color_[i], hoisted, 0, temp, 2, temp, 3);
+      }
+      a_.OpElse();
+      {
+        a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+        a_.OpIf(true, temp_x_src);
+        {
+          a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b0111),
+                   dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(0));
+          a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b0111),
+                   dxbc::Src::R(system_temps_color_[i]), rt_clamp_vec_src.Select(2));
+        }
+        a_.OpEndIf();
+        a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+        a_.OpIf(true, temp_x_src);
+        {
+          a_.OpMax(dxbc::Dest::R(system_temps_color_[i], 0b1000),
+                   dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                   rt_clamp_vec_src.Select(1));
+          a_.OpMin(dxbc::Dest::R(system_temps_color_[i], 0b1000),
+                   dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                   rt_clamp_vec_src.Select(3));
+        }
+        a_.OpEndIf();
+        a_.OpMov(dxbc::Dest::R(hoisted, 0b0011), dxbc::Src::LU(0));
+      }
+      a_.OpEndIf();
+    }
+  }
 
   // Do late depth/stencil test (which includes writing) if needed or deferred
   // depth writing.
@@ -1897,9 +1980,6 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   }
 
   // Write color values.
-  uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
-  uint32_t edram_size_32bpp_samples = (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) *
-                                      tile_width * xenos::kEdramTileCount;
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(shader_writes_color_targets & (1 << i))) {
       continue;
@@ -1934,16 +2014,32 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     // temp.x = free.
     a_.OpIf(true, temp_x_src);
 
+    dxbc::Src rt_format_flags_src(LoadSystemConstant(
+        SystemConstants::Index::kEdramRTFormatFlags,
+        offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i, dxbc::Src::kXXXX));
+    dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
+        SystemConstants::Index::kEdramRTBlendFactorsOps,
+        offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
+        dxbc::Src::kXXXX));
+    dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
+        SystemConstants::Index::kEdramRTClamp,
+        offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
+
+    if (hoisted_color_temps[i] != UINT32_MAX) {
+      // Prepared before the ordered section (REX_ROV_HOIST).
+      // system_temp_rov_params_.y = EDRAM address of sample 0.
+      a_.OpMov(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+               dxbc::Src::R(hoisted_color_temps[i], dxbc::Src::kZZZZ));
+      // temp.xy = packed color if not blending, 0 if blending.
+      a_.OpMov(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(hoisted_color_temps[i]));
+    } else {
+
     // Apply the exponent bias after alpha to coverage because it needs the
     // unbiased alpha from the shader.
     a_.OpMul(dxbc::Dest::R(system_temps_color_[i]), dxbc::Src::R(system_temps_color_[i]),
              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                 dxbc::Src::kXXXX));
-
-    dxbc::Src rt_format_flags_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTFormatFlags,
-        offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i, dxbc::Src::kXXXX));
 
     // Load whether the render target is 64bpp to system_temp_rov_params_.y to
     // get the needed relative sample address.
@@ -1968,13 +2064,6 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
               dxbc::Src::LU(edram_size_32bpp_samples));
 
-    dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTBlendFactorsOps,
-        offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
-        dxbc::Src::kXXXX));
-    dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTClamp,
-        offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
     // Get if not blending to pack the color once for all 4 samples.
     // temp.x = whether blending is disabled.
     a_.OpIEq(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(0x00010001));
@@ -2035,6 +2124,8 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       a_.OpMov(dxbc::Dest::R(temp, 0b0011), dxbc::Src::LU(0));
     }
     a_.OpEndIf();
+
+    }  // hoisted_color_temps[i] == UINT32_MAX
 
     // Blend, mask and write all samples.
     for (uint32_t j = 0; j < 4; ++j) {
@@ -2634,6 +2725,12 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     a_.OpEndIf();
   }
 
+  // Release hoisted_color_temps (pushed after temp, so released before it).
+  for (uint32_t i = 4; i-- > 0;) {
+    if (hoisted_color_temps[i] != UINT32_MAX) {
+      PopSystemTemp();
+    }
+  }
   // Release temp.
   PopSystemTemp();
 }

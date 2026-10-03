@@ -48,6 +48,17 @@ inline bool RovSampleRateDebug() {
   return value;
 }
 
+// ROV research: REX_ROV_HOIST=1 prepares the color (exponent bias, clamping,
+// packing without blending, the EDRAM address) before the late depth / stencil
+// test, so the ordered section only contains the EDRAM read-modify-write.
+inline bool RovHoistDebug() {
+  static const bool value = [] {
+    const char* env = std::getenv("REX_ROV_HOIST");
+    return env && *env == '1';
+  }();
+  return value;
+}
+
 class ShaderTranslator {
  public:
   virtual ~ShaderTranslator();

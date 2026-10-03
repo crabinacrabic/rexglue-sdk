@@ -884,6 +884,15 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
         regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]).color_format);
     modification.pixel.rov_rt2_format = uint32_t(
         regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]).color_format);
+    // The same value the command processor puts into edram_rt_blend_factors_ops.
+    uint32_t rt0_blend_factors_ops = regs[reg::RB_BLENDCONTROL::rt_register_indices[0]] & 0x1FFF1FFF;
+    modification.pixel.rov_rt0_blend = 0;
+    for (uint32_t i = 0; i < std::size(DxbcShaderTranslator::kRovKnownBlendFactorsOps); ++i) {
+      if (DxbcShaderTranslator::kRovKnownBlendFactorsOps[i] == rt0_blend_factors_ops) {
+        modification.pixel.rov_rt0_blend = i + 1;
+        break;
+      }
+    }
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

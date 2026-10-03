@@ -183,6 +183,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t rov_rt0_format : 4;
       uint32_t rov_rt1_format : 4;
       uint32_t rov_rt2_format : 4;
+      // Index + 1 in kRovKnownBlendFactorsOps of RT 0's blend factors and
+      // operations, 0 if not one of them (REX_ROV_KNOWN_FORMATS).
+      uint32_t rov_rt0_blend : 3;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -649,6 +652,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // is known from the modification (REX_ROV_KNOWN_FORMATS), the system
   // constant otherwise.
   dxbc::Src ROV_LoadRTFormatFlags(uint32_t rt_index);
+  // The same for edram_rt_blend_factors_ops (RB_BLENDCONTROL & 0x1FFF1FFF).
+  dxbc::Src ROV_LoadRTBlendFactorsOps(uint32_t rt_index);
+
+ public:
+  // Frequent RB_BLENDCONTROL & 0x1FFF1FFF values that can be passed in the
+  // pixel shader modification (rov_rt0_blend = index + 1).
+  static constexpr uint32_t kRovKnownBlendFactorsOps[7] = {
+      0x00010001,  // No blending.
+      0x01010001,  // Color = source, alpha = source + destination.
+      0x01010706,  // Color alpha blending, alpha = source + destination.
+      0x07060706,  // Alpha blending of both.
+      0x01010101,  // Additive.
+      0x01060106,  // Source alpha weighted additive.
+      0x07010706,  // Color alpha blending, alpha = source + (1 - sa) * destination.
+  };
+
+ private:
 
   bool IsDxbcVertexShader() const {
     return is_vertex_shader() && !Shader::IsHostVertexShaderTypeDomain(

@@ -38,6 +38,19 @@ dxbc::Src DxbcShaderTranslator::ROV_LoadRTFormatFlags(uint32_t rt_index) {
                             dxbc::Src::kXXXX);
 }
 
+dxbc::Src DxbcShaderTranslator::ROV_LoadRTBlendFactorsOps(uint32_t rt_index) {
+  if (edram_rov_used_ && rt_index == 0) {
+    Modification modification = GetDxbcShaderModification();
+    if (modification.pixel.rov_rt_formats_known && modification.pixel.rov_rt0_blend) {
+      return dxbc::Src::LU(kRovKnownBlendFactorsOps[modification.pixel.rov_rt0_blend - 1]);
+    }
+  }
+  return LoadSystemConstant(SystemConstants::Index::kEdramRTBlendFactorsOps,
+                            offsetof(SystemConstants, edram_rt_blend_factors_ops) +
+                                sizeof(uint32_t) * rt_index,
+                            dxbc::Src::kXXXX);
+}
+
 void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   bool any_color_targets_written = current_shader().writes_color_targets() != 0;
 
@@ -1891,10 +1904,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
                     dxbc::Src::kXXXX));
       a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(hoisted, 0b0100),
                 dxbc::Src::R(hoisted, dxbc::Src::kZZZZ), dxbc::Src::LU(edram_size_32bpp_samples));
-      dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
-          SystemConstants::Index::kEdramRTBlendFactorsOps,
-          offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
-          dxbc::Src::kXXXX));
+      dxbc::Src rt_blend_factors_ops_src(ROV_LoadRTBlendFactorsOps(i));
       dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
           SystemConstants::Index::kEdramRTClamp,
           offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
@@ -2039,10 +2049,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     a_.OpIf(true, temp_x_src);
 
     dxbc::Src rt_format_flags_src(ROV_LoadRTFormatFlags(i));
-    dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTBlendFactorsOps,
-        offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
-        dxbc::Src::kXXXX));
+    dxbc::Src rt_blend_factors_ops_src(ROV_LoadRTBlendFactorsOps(i));
     dxbc::Src rt_clamp_vec_src(LoadSystemConstant(
         SystemConstants::Index::kEdramRTClamp,
         offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));

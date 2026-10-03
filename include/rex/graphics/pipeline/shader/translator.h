@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
@@ -72,6 +74,28 @@ inline bool RovKnownFormatsDebug() {
     return env && *env == '1';
   }();
   return value;
+}
+
+// ROV research (REX_ROV_KNOWN_FORMATS): frequent RB_BLENDCONTROL & 0x1FFF1FFF
+// values (edram_rt_blend_factors_ops) that the pixel shader modification can
+// carry as index + 1, so the ROV / FSI code uses them as literals.
+inline constexpr uint32_t kRovKnownBlendFactorsOps[7] = {
+    0x00010001,  // No blending.
+    0x01010001,  // Color = source, alpha = source + destination.
+    0x01010706,  // Color alpha blending, alpha = source + destination.
+    0x07060706,  // Alpha blending of both.
+    0x01010101,  // Additive.
+    0x01060106,  // Source alpha weighted additive.
+    0x07010706,  // Color alpha blending, alpha = source + (1 - sa) * destination.
+};
+// Index + 1 of the value in kRovKnownBlendFactorsOps, 0 if it's not there.
+inline uint32_t RovKnownBlendIndex(uint32_t blend_factors_ops) {
+  for (uint32_t i = 0; i < uint32_t(std::size(kRovKnownBlendFactorsOps)); ++i) {
+    if (kRovKnownBlendFactorsOps[i] == blend_factors_ops) {
+      return i + 1;
+    }
+  }
+  return 0;
 }
 
 inline bool RovHoistDebug() {

@@ -10,6 +10,11 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+
+#include <fmt/format.h>
 
 #include <rex/assert.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -51,6 +56,22 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
         shader().ucode_data_hash(), modification());
     MakeInvalid();
     return VK_NULL_HANDLE;
+  }
+  // ROV research: REX_VK_DUMP_SPIRV=<directory> writes every translated guest
+  // shader as <vs|ps>_<ucode hash>_<modification>.spv for offline compilation
+  // with the installed driver (Radeon GPU Analyzer, rga -s vulkan).
+  static const char* const dump_dir = std::getenv("REX_VK_DUMP_SPIRV");
+  if (dump_dir && *dump_dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dump_dir, ec);
+    std::filesystem::path path =
+        std::filesystem::path(dump_dir) /
+        fmt::format("{}_{:016X}_{:016X}.spv",
+                    shader().type() == xenos::ShaderType::kPixel ? "ps" : "vs",
+                    shader().ucode_data_hash(), modification());
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(translated_binary().data()),
+               std::streamsize(translated_binary().size()));
   }
   return shader_module_;
 }

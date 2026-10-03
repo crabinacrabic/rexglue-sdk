@@ -1169,7 +1169,13 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     if (edram_fragment_shader_interlock_) {
       // Accessing per-sample values, so interlocking just when there's common
       // coverage is enough if the device exposes that.
-      if (features_.fragment_shader_sample_interlock) {
+      // ROV research: REX_VK_PIXEL_INTERLOCK=1 forces pixel interlock to
+      // measure whether the driver orders per sample with sample interlock.
+      static const bool force_pixel_interlock = [] {
+        const char* env = std::getenv("REX_VK_PIXEL_INTERLOCK");
+        return env && *env == '1';
+      }();
+      if (features_.fragment_shader_sample_interlock && !force_pixel_interlock) {
         builder_->addCapability(spv::CapabilityFragmentShaderSampleInterlockEXT);
         builder_->addExecutionMode(function_main_, spv::ExecutionModeSampleInterlockOrderedEXT);
       } else {

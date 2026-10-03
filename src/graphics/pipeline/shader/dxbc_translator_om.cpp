@@ -331,6 +331,19 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // Using ForcedSampleCount of 4 (2 is not supported on Nvidia), so for 2x
   // MSAA, handling samples 0 and 3 (upper-left and lower-right) as 0 and 1.
 
+  // ROV research (REX_ROV_SAMPLE_RATE): at sample frequency, every invocation
+  // handles only its own sample.
+  dxbc::Src coverage_src(dxbc::Src::VCoverage());
+  uint32_t sample_coverage_temp = UINT32_MAX;
+  if (RovSampleRateDebug()) {
+    sample_coverage_temp = PushSystemTemp();
+    a_.OpIShL(dxbc::Dest::R(sample_coverage_temp, 0b0001), dxbc::Src::LU(1),
+              dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kYYYY));
+    a_.OpAnd(dxbc::Dest::R(sample_coverage_temp, 0b0001),
+             dxbc::Src::R(sample_coverage_temp, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+    coverage_src = dxbc::Src::R(sample_coverage_temp, dxbc::Src::kXXXX);
+  }
+
   // Check if 4x MSAA is enabled.
   a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
                                    offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
@@ -340,25 +353,29 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
     // 12), because on the Xbox 360, 2x MSAA doubles the storage height, 4x MSAA
     // doubles the storage width.
     // Flip samples in bits 0:1 to bits 29:30.
-    a_.OpBFRev(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::VCoverage());
+    a_.OpBFRev(dxbc::Dest::R(system_temp_rov_params_, 0b0001), coverage_src);
     a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(29));
     a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(1),
-             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), coverage_src);
   }
   // Handle 1 or 2 samples.
   a_.OpElse();
   {
     // Extract sample 3 coverage, which will be used as sample 1.
     a_.OpUBFE(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(3),
-              dxbc::Src::VCoverage());
+              coverage_src);
     // Combine coverage of samples 0 (in bit 0 of vCoverage) and 3 (in bit 0 of
     // system_temp_rov_params_.x).
     a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), coverage_src);
   }
   // Close the 4x MSAA conditional.
   a_.OpEndIf();
+  if (sample_coverage_temp != UINT32_MAX) {
+    // Release sample_coverage_temp.
+    PopSystemTemp();
+  }
 }
 
 void DxbcShaderTranslator::ROV_DepthStencilTest() {

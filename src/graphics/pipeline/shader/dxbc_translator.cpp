@@ -2644,10 +2644,12 @@ void DxbcShaderTranslator::WriteInputSignature() {
     }
 
     // Sample index (SV_SampleIndex) for safe memexport with sample-rate
-    // shading.
+    // shading, or for the sample-rate ROV experiment.
     size_t sample_index_position = SIZE_MAX;
-    if (current_shader().memexport_eM_written() && IsSampleRate()) {
-      size_t sample_index_position = shader_object_.size();
+    if ((current_shader().memexport_eM_written() && IsSampleRate()) ||
+        (edram_rov_used_ && RovSampleRateDebug())) {
+      // Not a new local: the semantic name is patched through this below.
+      sample_index_position = shader_object_.size();
       shader_object_.resize(shader_object_.size() + kParameterDwords);
       ++parameter_count;
       {
@@ -3348,13 +3350,25 @@ void DxbcShaderTranslator::WriteShaderCode() {
     // shading is only needed for float24 depth conversion when using a float32
     // host depth buffer).
     assert_false(sample_rate_memexport && edram_rov_used_);
-    uint32_t front_face_and_sample_index_mask =
-        uint32_t(in_front_face_used_) | (uint32_t(sample_rate_memexport) << 1);
-    if (front_face_and_sample_index_mask) {
-      // Is front face, sample index.
-      ao_.OpDclInputPSSGV(
-          dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, front_face_and_sample_index_mask),
-          dxbc::Name::kIsFrontFace);
+    bool sample_rate_rov = edram_rov_used_ && RovSampleRateDebug();
+    if (sample_rate_rov) {
+      // Separate declarations, as FXC emits them; SV_SampleIndex makes the
+      // pixel shader run at sample frequency.
+      if (in_front_face_used_) {
+        ao_.OpDclInputPSSGV(dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, 0b0001),
+                            dxbc::Name::kIsFrontFace);
+      }
+      ao_.OpDclInputPSSGV(dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, 0b0010),
+                          dxbc::Name::kSampleIndex);
+    } else {
+      uint32_t front_face_and_sample_index_mask =
+          uint32_t(in_front_face_used_) | (uint32_t(sample_rate_memexport) << 1);
+      if (front_face_and_sample_index_mask) {
+        // Is front face, sample index.
+        ao_.OpDclInputPSSGV(
+            dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, front_face_and_sample_index_mask),
+            dxbc::Name::kIsFrontFace);
+      }
     }
     if (edram_rov_used_) {
       // Sample coverage input.

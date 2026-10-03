@@ -36,6 +36,18 @@ inline bool RovLateDepthDebug() {
   return value;
 }
 
+// ROV research: REX_ROV_SAMPLE_RATE=1 runs the D3D12 ROV pixel shader at sample
+// frequency (SV_SampleIndex input, coverage masked to the own sample), so POPS
+// orders overlapping invocations per sample instead of per pixel. Formally not
+// allowed with ForcedSampleCount (UAV-only rendering) - an experiment.
+inline bool RovSampleRateDebug() {
+  static const bool value = [] {
+    const char* env = std::getenv("REX_ROV_SAMPLE_RATE");
+    return env && *env == '1';
+  }();
+  return value;
+}
+
 class ShaderTranslator {
  public:
   virtual ~ShaderTranslator();

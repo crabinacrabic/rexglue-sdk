@@ -176,6 +176,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // ROV research (REX_ROV_KNOWN_FORMATS): the formats of color render
+      // targets 0...2 are known at translation time
+      // (xenos::ColorRenderTargetFormat), so the EDRAM format switches fold.
+      uint32_t rov_rt_formats_known : 1;
+      uint32_t rov_rt0_format : 4;
+      uint32_t rov_rt1_format : 4;
+      uint32_t rov_rt2_format : 4;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -637,6 +644,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
   Modification GetDxbcShaderModification() const {
     return Modification(current_translation().modification());
   }
+
+  // The EDRAM format flags of a color render target: a literal when the format
+  // is known from the modification (REX_ROV_KNOWN_FORMATS), the system
+  // constant otherwise.
+  dxbc::Src ROV_LoadRTFormatFlags(uint32_t rt_index);
 
   bool IsDxbcVertexShader() const {
     return is_vertex_shader() && !Shader::IsHostVertexShaderTypeDomain(

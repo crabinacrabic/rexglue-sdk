@@ -873,6 +873,19 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
     modification.pixel.param_gen_point = 0;
   }
 
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
+      RovKnownFormatsDebug()) {
+    // ROV research (REX_ROV_KNOWN_FORMATS): the same format the command
+    // processor puts into edram_rt_format_flags for written render targets.
+    modification.pixel.rov_rt_formats_known = 1;
+    modification.pixel.rov_rt0_format = uint32_t(
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format);
+    modification.pixel.rov_rt1_format = uint32_t(
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]).color_format);
+    modification.pixel.rov_rt2_format = uint32_t(
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[2]).color_format);
+  }
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&

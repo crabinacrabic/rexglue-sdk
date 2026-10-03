@@ -22,6 +22,22 @@
 namespace rex::graphics {
 using namespace ucode;
 
+dxbc::Src DxbcShaderTranslator::ROV_LoadRTFormatFlags(uint32_t rt_index) {
+  if (edram_rov_used_ && rt_index < 3) {
+    Modification modification = GetDxbcShaderModification();
+    if (modification.pixel.rov_rt_formats_known) {
+      uint32_t format = rt_index == 0   ? modification.pixel.rov_rt0_format
+                        : rt_index == 1 ? modification.pixel.rov_rt1_format
+                                        : modification.pixel.rov_rt2_format;
+      return dxbc::Src::LU(
+          RenderTargetCache::AddPSIColorFormatFlags(xenos::ColorRenderTargetFormat(format)));
+    }
+  }
+  return LoadSystemConstant(SystemConstants::Index::kEdramRTFormatFlags,
+                            offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * rt_index,
+                            dxbc::Src::kXXXX);
+}
+
 void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   bool any_color_targets_written = current_shader().writes_color_targets() != 0;
 
@@ -1094,10 +1110,7 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   a_.OpMov(dxbc::Dest::R(color_temp, 0b1100), dxbc::Src::LF(0.0f, 0.0f, 0.0f, 1.0f));
 
   // Choose the packing based on the render target's format.
-  a_.OpSwitch(LoadSystemConstant(
-      SystemConstants::Index::kEdramRTFormatFlags,
-      offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * rt_index,
-      dxbc::Src::kXXXX));
+  a_.OpSwitch(ROV_LoadRTFormatFlags(rt_index));
 
   // ***************************************************************************
   // k_8_8_8_8
@@ -1239,10 +1252,7 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   a_.OpMov(dxbc::Dest::R(packed_temp, 1 << (packed_temp_components + 1)), dxbc::Src::LU(0));
 
   // Choose the packing based on the render target's format.
-  a_.OpSwitch(LoadSystemConstant(
-      SystemConstants::Index::kEdramRTFormatFlags,
-      offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * rt_index,
-      dxbc::Src::kXXXX));
+  a_.OpSwitch(ROV_LoadRTFormatFlags(rt_index));
 
   // ***************************************************************************
   // k_8_8_8_8
@@ -1868,10 +1878,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
                LoadSystemConstant(SystemConstants::Index::kColorExpBias,
                                   offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                   dxbc::Src::kXXXX));
-      dxbc::Src rt_format_flags_src(LoadSystemConstant(
-          SystemConstants::Index::kEdramRTFormatFlags,
-          offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i,
-          dxbc::Src::kXXXX));
+      dxbc::Src rt_format_flags_src(ROV_LoadRTFormatFlags(i));
       a_.OpAnd(dxbc::Dest::R(hoisted, 0b0100), rt_format_flags_src,
                dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
       a_.OpMovC(dxbc::Dest::R(hoisted, 0b0100), dxbc::Src::R(hoisted, dxbc::Src::kZZZZ),
@@ -2031,9 +2038,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     // temp.x = free.
     a_.OpIf(true, temp_x_src);
 
-    dxbc::Src rt_format_flags_src(LoadSystemConstant(
-        SystemConstants::Index::kEdramRTFormatFlags,
-        offsetof(SystemConstants, edram_rt_format_flags) + sizeof(uint32_t) * i, dxbc::Src::kXXXX));
+    dxbc::Src rt_format_flags_src(ROV_LoadRTFormatFlags(i));
     dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
         SystemConstants::Index::kEdramRTBlendFactorsOps,
         offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,

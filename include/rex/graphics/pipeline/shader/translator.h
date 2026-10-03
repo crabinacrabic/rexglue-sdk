@@ -63,6 +63,17 @@ inline uint32_t RovPadDebug() {
   return value;
 }
 
+// ROV research: REX_ROV_KNOWN_FORMATS=1 passes the color render target formats
+// in the pixel shader modification, so the ROV EDRAM code uses literal format
+// flags instead of the system constant and the driver folds the format switches.
+inline bool RovKnownFormatsDebug() {
+  static const bool value = [] {
+    const char* env = std::getenv("REX_ROV_KNOWN_FORMATS");
+    return env && *env == '1';
+  }();
+  return value;
+}
+
 inline bool RovHoistDebug() {
   static const bool value = [] {
     const char* env = std::getenv("REX_ROV_HOIST");

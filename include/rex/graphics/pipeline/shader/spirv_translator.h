@@ -88,6 +88,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // ROV research (REX_ROV_KNOWN_FORMATS), FSI: the formats of color render
+      // targets 0 and 1 (xenos::ColorRenderTargetFormat) and the index + 1 of
+      // RT 0's blending in kRovKnownBlendFactorsOps (translator.h) are known at
+      // translation time, so the EDRAM format and blending branches fold.
+      uint32_t fsi_rt_formats_known : 1;
+      uint32_t fsi_rt0_format : 4;
+      uint32_t fsi_rt1_format : 4;
+      uint32_t fsi_rt0_blend : 3;
     } pixel;
     uint64_t value = 0;
 

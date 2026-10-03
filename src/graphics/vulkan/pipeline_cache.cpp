@@ -1039,6 +1039,19 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_point = 0;
   }
 
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
+      RovKnownFormatsDebug()) {
+    // ROV research (REX_ROV_KNOWN_FORMATS): the same values the command
+    // processor puts into edram_rt_format_flags / edram_rt_blend_factors_ops.
+    modification.pixel.fsi_rt_formats_known = 1;
+    modification.pixel.fsi_rt0_format = uint32_t(
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format);
+    modification.pixel.fsi_rt1_format = uint32_t(
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]).color_format);
+    modification.pixel.fsi_rt0_blend =
+        RovKnownBlendIndex(regs[reg::RB_BLENDCONTROL::rt_register_indices[0]] & 0x1FFF1FFF);
+  }
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&

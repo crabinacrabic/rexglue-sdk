@@ -994,6 +994,15 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                         id_vector_temp_),
             spv::NoPrecision);
+        // ROV research (REX_ROV_KNOWN_FORMATS): a literal when the format is
+        // known from the modification, so the driver folds the format branches.
+        Modification fsi_modification = GetSpirvShaderModification();
+        if (fsi_modification.pixel.fsi_rt_formats_known && color_target_index < 2) {
+          rt_format_with_flags = builder_->makeUintConstant(
+              RenderTargetCache::AddPSIColorFormatFlags(xenos::ColorRenderTargetFormat(
+                  color_target_index ? fsi_modification.pixel.fsi_rt1_format
+                                     : fsi_modification.pixel.fsi_rt0_format)));
+        }
 
         spv::Id rt_is_64bpp = builder_->createBinOp(
             spv::OpINotEqual, type_bool_,
@@ -1029,6 +1038,11 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                         id_vector_temp_),
             spv::NoPrecision);
+        if (fsi_modification.pixel.fsi_rt_formats_known && color_target_index == 0 &&
+            fsi_modification.pixel.fsi_rt0_blend) {
+          rt_blend_factors_equations = builder_->makeUintConstant(
+              kRovKnownBlendFactorsOps[fsi_modification.pixel.fsi_rt0_blend - 1]);
+        }
 
         // Check if blending (the blending is not 1 * source + 0 * destination).
         spv::Id rt_blend_enabled =

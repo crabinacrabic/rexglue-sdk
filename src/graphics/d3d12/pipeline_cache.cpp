@@ -2898,15 +2898,20 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     if (msaa_sample_count != 1 && msaa_sample_count != 4) {
       return nullptr;
     }
-    state_desc.RasterizerState.ForcedSampleCount = uint32_t(1)
-                                                   << uint32_t(description.host_msaa_samples);
+    // ROV research (REX_ROV_SAMPLE_RATE): sample-rate shading is not allowed
+    // with ForcedSampleCount, so rasterize with a real sample count instead
+    // (UAV-only rendering with SampleDesc.Count > 1).
+    if (!RovSampleRateDebug()) {
+      state_desc.RasterizerState.ForcedSampleCount = uint32_t(1)
+                                                     << uint32_t(description.host_msaa_samples);
+    }
   }
 
   // Sample mask and description.
   state_desc.SampleMask = UINT_MAX;
   // TODO(Triang3l): 4x MSAA fallback when 2x isn't supported without ROV.
   if (edram_rov_used) {
-    state_desc.SampleDesc.Count = 1;
+    state_desc.SampleDesc.Count = RovSampleRateDebug() ? msaa_sample_count : 1;
   } else {
     assert_true(msaa_sample_count <= 4);
     if (msaa_sample_count > 4) {

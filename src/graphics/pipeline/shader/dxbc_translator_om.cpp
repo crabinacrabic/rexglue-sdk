@@ -1964,6 +1964,23 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     }
   } else {
     ROV_DepthStencilTest();
+    uint32_t pad_steps = RovPadDebug();
+    if (pad_steps) {
+      // ROV research (REX_ROV_PAD): lengthen the ordered section with a
+      // dependent xorshift chain seeded with the per-pixel EDRAM address.
+      a_.OpIAdd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                dxbc::Src::LU(0x9E3779B9));
+      for (uint32_t i = 0; i < pad_steps; ++i) {
+        a_.OpIShL(temp_y_dest, temp_x_src, dxbc::Src::LU(13));
+        a_.OpXOr(temp_x_dest, temp_x_src, temp_y_src);
+        a_.OpUShR(temp_y_dest, temp_x_src, dxbc::Src::LU(17));
+        a_.OpXOr(temp_x_dest, temp_x_src, temp_y_src);
+        a_.OpIShL(temp_y_dest, temp_x_src, dxbc::Src::LU(5));
+        a_.OpXOr(temp_x_dest, temp_x_src, temp_y_src);
+      }
+      a_.OpIEq(temp_x_dest, temp_x_src, dxbc::Src::LU(0x2545F491));
+      a_.OpDiscard(true, temp_x_src);
+    }
   }
 
   // system_temp_rov_params_.y (the depth / stencil sample address) is not

@@ -51,6 +51,18 @@ inline bool RovSampleRateDebug() {
 // ROV research: REX_ROV_HOIST=1 prepares the color (exponent bias, clamping,
 // packing without blending, the EDRAM address) before the late depth / stencil
 // test, so the ordered section only contains the EDRAM read-modify-write.
+// ROV research: REX_ROV_PAD=N adds N xorshift steps (3 dependent integer ops
+// each) inside the ordered section, right after the late depth / stencil test,
+// to measure how the frame time depends on the length of the ordered section.
+// The result only discards a pixel if it equals one 32-bit constant.
+inline uint32_t RovPadDebug() {
+  static const uint32_t value = [] {
+    const char* env = std::getenv("REX_ROV_PAD");
+    return env ? uint32_t(std::strtoul(env, nullptr, 10)) : uint32_t(0);
+  }();
+  return value;
+}
+
 inline bool RovHoistDebug() {
   static const bool value = [] {
     const char* env = std::getenv("REX_ROV_HOIST");

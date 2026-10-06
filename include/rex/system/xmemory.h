@@ -315,10 +315,19 @@ class PhysicalHeap : public BaseHeap {
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers);
-  // Returns true if any page in the range was watched.
+  // Returns true if any page in the range was watched. Reads (is_write false)
+  // only trigger data providers.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
-                        bool unwatch_exact_range, bool unprotect = true);
+                        bool unwatch_exact_range, bool unprotect = true,
+                        bool discard_provided_data = false);
+  // Clears the data provider flags of the system pages touched by the physical
+  // range and lowers their protection to what the guest and the invalidation
+  // watches need. The global critical region must be locked.
+  void DisableDataProviders(uint32_t physical_address, uint32_t length);
+  // Whether any system page touched by the physical range has data providers.
+  // The global critical region must be locked.
+  bool HasDataProviders(uint32_t physical_address, uint32_t length) const;
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -340,7 +349,14 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Whether any access to each page must first make the guest memory current
+    // via the data providers (the page is not accessible meanwhile).
+    uint64_t provide_data;
   };
+  // Physical range (heap-relative system pages first..last) of a physical
+  // address range, false if it's outside the heap.
+  bool GetSystemPageRange(uint32_t physical_address, uint32_t length, uint32_t& system_page_first,
+                          uint32_t& system_page_last) const;
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
   std::vector<SystemPageFlagsBlock> system_page_flags_;
@@ -479,8 +495,15 @@ class Memory {
   //
   // - Data providers:
   //
-  // TODO(Triang3l): Implement data providers - more complicated because they
-  // will need to be able to release the global lock.
+  // For memory written by the GPU whose contents are copied to the guest memory
+  // only when the CPU needs them (lazy readback). Enabling them makes the pages
+  // inaccessible in the virtual views; any access (by the guest or by host
+  // code through the virtual views) calls the providers first, which write the
+  // data through the physical mapping (TranslatePhysical, never protected).
+  // Host code accessing memory through the physical mapping must call
+  // FlushPhysicalMemoryDataProviders first. Providers are called with the
+  // global critical region locked and may wait for the GPU, but only for work
+  // already submitted.
 
   // Returns start and length of the smallest physical memory region surrounding
   // the watched region that can be safely unwatched, if it doesn't matter,
@@ -494,6 +517,23 @@ class Memory {
   // Unregisters a physical memory invalidation callback previously added with
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
+
+  // Makes the guest memory hold the latest data in the physical range (system
+  // page aligned) and possibly more; returns the physical range (start,
+  // length) now current, whose data providers will be disabled. With discard
+  // (the memory is being decommitted or released), the pending data is dropped
+  // without writing it.
+  typedef std::pair<uint32_t, uint32_t> (*PhysicalMemoryDataProviderCallback)(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length, bool discard);
+  void* RegisterPhysicalMemoryDataProvider(PhysicalMemoryDataProviderCallback callback,
+                                           void* callback_context);
+  void UnregisterPhysicalMemoryDataProvider(void* provider_handle);
+  // For host code reading or writing guest memory through the physical mapping
+  // (bypassing the protection): makes the range current first.
+  void FlushPhysicalMemoryDataProviders(uint32_t physical_address, uint32_t length);
+  // Stops providing data for the range in all the views (the data is current).
+  // The global critical region must be locked.
+  void DisablePhysicalMemoryDataProviders(uint32_t physical_address, uint32_t length);
 
   // Enables physical memory access callbacks for the specified memory range,
   // snapped to system page boundaries.
@@ -624,6 +664,11 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  std::vector<std::pair<PhysicalMemoryDataProviderCallback, void*>*>
+      physical_memory_data_providers_;
+  // Calls the data providers for the physical range and disables them for the
+  // range they have made current. The global critical region must be locked.
+  void ProvidePhysicalMemoryData(uint32_t physical_address, uint32_t length, bool discard);
 };
 
 }  // namespace rex::memory

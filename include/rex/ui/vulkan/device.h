@@ -123,6 +123,12 @@ class VulkanDevice {
 
     bool scalarBlockLayout = false;
 
+    // VK_KHR_timeline_semaphore (#208, promoted to 1.2) - waiting for GPU
+    // submissions from threads other than the command processor (lazy
+    // readback).
+
+    bool timelineSemaphore = false;
+
     // VK_KHR_portability_subset (#164)
 
     bool constantAlphaColorBlendFactors = false;

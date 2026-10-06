@@ -155,6 +155,12 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
+          // Pending lazily read back GPU data around the buffer must be in the
+          // guest memory before the host writes it via the physical mapping.
+          if (buffer_physical_heap) {
+            memory()->FlushPhysicalMemoryDataProviders(
+                buffer_physical_heap->GetPhysicalAddress(buffer_guest_address), buffer_length);
+          }
           result = file_->ReadSync(
               std::span<uint8_t>(
                   buffer_physical_heap
@@ -263,6 +269,12 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   }
 
   size_t bytes_written = 0;
+  // The host reads the buffer outside the guest exception handling, so pending
+  // lazily read back GPU data (inaccessible pages) must be made current first.
+  uint32_t buffer_physical_address = memory()->GetPhysicalAddress(buffer_guest_address);
+  if (buffer_physical_address != UINT32_MAX) {
+    memory()->FlushPhysicalMemoryDataProviders(buffer_physical_address, buffer_length);
+  }
   X_STATUS result = file_->WriteSync(
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);

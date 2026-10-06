@@ -44,6 +44,10 @@ enum class ReadbackResolveMode {
   kFast,
   kSome,
   kFull,
+  // The same guest-visible data as kFull, but copied to the guest memory only
+  // when the CPU accesses it (memory data providers); backends without support
+  // treat it as kFull.
+  kLazy,
 };
 
 struct SwapState {

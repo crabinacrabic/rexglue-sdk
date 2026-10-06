@@ -809,6 +809,45 @@ bool VulkanCommandProcessor::SetupContext() {
     guest_shader_vertex_stages_ |= VK_SHADER_STAGE_COMPUTE_BIT;
   }
 
+  // A timeline semaphore signaled with the submission index by every
+  // submission, so threads other than the command processor (lazy readback
+  // data providers) can await GPU work without touching the submission fences.
+  if (device_properties.timelineSemaphore) {
+    wait_semaphores_ = PFN_vkWaitSemaphores(
+        vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(device,
+                                                                          "vkWaitSemaphores"));
+    VkSemaphoreTypeCreateInfo timeline_type_create_info = {};
+    timeline_type_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    timeline_type_create_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timeline_type_create_info.initialValue = 0;
+    VkSemaphoreCreateInfo timeline_create_info = {};
+    timeline_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    timeline_create_info.pNext = &timeline_type_create_info;
+    if (!wait_semaphores_ || dfn.vkCreateSemaphore(device, &timeline_create_info, nullptr,
+                                                   &submission_timeline_semaphore_) != VK_SUCCESS) {
+      REXGPU_WARN("Failed to create the Vulkan submission timeline semaphore");
+      submission_timeline_semaphore_ = VK_NULL_HANDLE;
+    }
+  }
+  // Lazy readback (readback_resolve = "lazy") needs waiting for submissions
+  // from the threads accessing the guest memory.
+  if (submission_timeline_semaphore_ != VK_NULL_HANDLE) {
+    readback_tracker_ = std::make_unique<ReadbackTracker>(
+        *memory_, [this](uint64_t submission) { return AwaitSubmissionFromAnyThread(submission); },
+        [this](void* source_handle) {
+          const ui::vulkan::VulkanDevice* const tracker_device = GetVulkanDevice();
+          VkMappedMemoryRange range = {};
+          range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+          range.memory = VkDeviceMemory(source_handle);
+          range.size = VK_WHOLE_SIZE;
+          tracker_device->functions().vkInvalidateMappedMemoryRanges(tracker_device->device(), 1,
+                                                                     &range);
+        });
+  } else if (GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve)) ==
+             ReadbackResolveMode::kLazy) {
+    REXGPU_WARN("readback_resolve = lazy needs timeline semaphores, using full readback");
+  }
+
   // 16384 is bigger than any single uniform buffer that Xenia needs, but is the
   // minimum maxUniformBufferRange, thus the safe minimum amount.
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
@@ -1916,6 +1955,9 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   DestroyScratchBuffer();
 
+  // Writes the pending lazily read back data while the buffers still exist.
+  readback_tracker_.reset();
+
   for (auto& readback_pair : readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -2126,6 +2168,8 @@ void VulkanCommandProcessor::ShutdownContext() {
     dfn.vkDestroyFence(device, fence, nullptr);
   }
   fences_free_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySemaphore, device,
+                                         submission_timeline_semaphore_);
 
   device_lost_ = false;
 
@@ -2299,6 +2343,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
 
   RovFsiAbOnSwap();
+  rov_ab_frame_ranges_.clear();
+  LogReadbackTrackerStats();
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -4184,7 +4230,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
-      if (REXCVAR_GET(readback_memexport_fast)) {
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        RovAbRecordGpuWrittenRange(memexport_range.base_address_dwords << 2,
+                                   memexport_range.size_bytes);
+      }
+      if (readback_tracker_ && GetEffectiveReadbackMode() == ReadbackResolveMode::kLazy) {
+        IssueDraw_MemexportReadbackLazyPath(memexport_total_size);
+      } else if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
@@ -4262,6 +4314,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
 
   const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(readback_mapping);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    if (readback_tracker_) {
+      memory_->FlushPhysicalMemoryDataProviders(memexport_range.base_address_dwords << 2,
+                                                memexport_range.size_bytes);
+    }
     std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
@@ -4270,6 +4326,113 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
   dfn.vkFreeMemory(device, readback_memory, nullptr);
   return true;
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackLazyPath(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const uint64_t readback_key =
+      MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+  ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
+  readback.last_used_frame = frame_current_;
+  const uint32_t index = readback.current_index;
+  const uint32_t readback_size = AlignReadbackBufferSize(total_size);
+  if (readback.buffers[index] == VK_NULL_HANDLE || readback.mapped_data[index] == nullptr ||
+      readback_size > readback.sizes[index]) {
+    VkBuffer new_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory new_memory = VK_NULL_HANDLE;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
+      return IssueDraw_MemexportReadbackFullPath(total_size);
+    }
+    void* new_mapping = nullptr;
+    if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+      dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+      dfn.vkFreeMemory(device, new_memory, nullptr);
+      return IssueDraw_MemexportReadbackFullPath(total_size);
+    }
+    if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
+      if (readback.mapped_data[index] != nullptr) {
+        readback_tracker_->FlushSource(static_cast<const uint8_t*>(readback.mapped_data[index]),
+                                       readback.sizes[index]);
+      }
+      // The GPU may still be using the old buffer.
+      AwaitAllQueueOperationsCompletion();
+      if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
+        dfn.vkUnmapMemory(device, readback.memories[index]);
+      }
+      if (readback.buffers[index] != VK_NULL_HANDLE) {
+        dfn.vkDestroyBuffer(device, readback.buffers[index], nullptr);
+      }
+      if (readback.memories[index] != VK_NULL_HANDLE) {
+        dfn.vkFreeMemory(device, readback.memories[index], nullptr);
+      }
+    }
+    readback.buffers[index] = new_buffer;
+    readback.memories[index] = new_memory;
+    readback.mapped_data[index] = new_mapping;
+    readback.sizes[index] = readback_size;
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = memexport_range.base_address_dwords << 2;
+    readback_region.dstOffset = readback_offset;
+    readback_region.size = memexport_range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback.buffers[index], 1,
+                                             &readback_region);
+    readback_offset += memexport_range.size_bytes;
+  }
+  PushBufferMemoryBarrier(readback.buffers[index], 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  // Submitted before any other thread may wait for it.
+  uint64_t readback_submission = GetCurrentSubmission();
+  EndSubmission(false);
+  readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    readback_tracker_->AddPendingRange(
+        memexport_range.base_address_dwords << 2, memexport_range.size_bytes,
+        static_cast<const uint8_t*>(readback.mapped_data[index]) + readback_offset,
+        reinterpret_cast<void*>(readback.memories[index]), readback_submission);
+    readback_offset += memexport_range.size_bytes;
+  }
+  readback.current_index = 1 - index;
+  return true;
+}
+
+void VulkanCommandProcessor::LogReadbackTrackerStats() {
+  static const bool sync_stats = [] {
+    const char* env = std::getenv("REX_VK_SYNC_STATS");
+    return env && *env == '1';
+  }();
+  if (!sync_stats || !readback_tracker_) {
+    return;
+  }
+  static auto report_since = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  const double window = std::chrono::duration<double>(now - report_since).count();
+  if (window < 5.0) {
+    return;
+  }
+  report_since = now;
+  ReadbackTracker::Stats stats = readback_tracker_->TakeStats();
+  REXGPU_INFO(
+      "Lazy readback over {:.1f} s: {} ranges added, {} provider calls, {} ranges / {} KB "
+      "provided, {} GPU waits ({:.1f} ms), {} pending",
+      window, stats.ranges_added, stats.provider_calls, stats.ranges_provided,
+      stats.bytes_provided >> 10, stats.gpu_waits, stats.wait_microseconds / 1000.0,
+      readback_tracker_->pending_range_count());
 }
 
 bool VulkanCommandProcessor::RovDumpEdram(std::vector<uint32_t>& dwords_out) {
@@ -4316,6 +4479,46 @@ bool VulkanCommandProcessor::RovDumpEdram(std::vector<uint32_t>& dwords_out) {
   return dumped;
 }
 
+ReadbackResolveMode VulkanCommandProcessor::GetEffectiveReadbackMode() const {
+  static const bool ab_readback = [] {
+    const char* env = std::getenv("REX_VK_AB_READBACK");
+    return env && *env == '1';
+  }();
+  if (ab_readback) {
+    int variant = RovAbVariant().load(std::memory_order_relaxed);
+    if (variant >= 0) {
+      return variant ? ReadbackResolveMode::kLazy : ReadbackResolveMode::kFull;
+    }
+  }
+  return GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+}
+
+void VulkanCommandProcessor::RovAbRecordGpuWrittenRange(uint32_t physical_address,
+                                                        uint32_t length) {
+  static const bool ab_enabled = [] {
+    const char* env = std::getenv("REX_VK_FSI_AB");
+    return env && *env;
+  }();
+  if (ab_enabled && length) {
+    rov_ab_frame_ranges_.emplace_back(physical_address, length);
+  }
+}
+
+void VulkanCommandProcessor::RovDumpGuestRanges(std::vector<uint8_t>& bytes_out) {
+  bytes_out.clear();
+  if (readback_tracker_) {
+    readback_tracker_->FlushAll();
+  }
+  for (const auto& range : rov_ab_frame_ranges_) {
+    size_t offset = bytes_out.size();
+    bytes_out.resize(offset + 8 + range.second);
+    std::memcpy(bytes_out.data() + offset, &range.first, 4);
+    std::memcpy(bytes_out.data() + offset + 4, &range.second, 4);
+    std::memcpy(bytes_out.data() + offset + 8, memory_->TranslatePhysical(range.first),
+                range.second);
+  }
+}
+
 void VulkanCommandProcessor::RovFsiAbOnSwap() {
   // Exactness check of REX_VK_FSI_SHORT in one run on a frozen scene: when the
   // file <dir>/go appears, dump the EDRAM with the reference variant (a1),
@@ -4329,6 +4532,7 @@ void VulkanCommandProcessor::RovFsiAbOnSwap() {
   }
   static uint32_t phase = 0, swaps_left = 0, idle_swaps = 0;
   static std::vector<uint32_t> dumps[3];
+  static std::vector<uint8_t> guest_dumps[3];
   static const char* const kDumpNames[3] = {"a1", "b", "a2"};
   const std::filesystem::path dir(ab_dir);
   if (!phase) {
@@ -4359,7 +4563,9 @@ void VulkanCommandProcessor::RovFsiAbOnSwap() {
     phase = 0;
     return;
   }
-  REXGPU_INFO("FSI A/B: dumped {}", kDumpNames[dump_index]);
+  RovDumpGuestRanges(guest_dumps[dump_index]);
+  REXGPU_INFO("FSI A/B: dumped {} ({} guest ranges, {} bytes)", kDumpNames[dump_index],
+              rov_ab_frame_ranges_.size(), guest_dumps[dump_index].size());
   if (phase < 3) {
     RovAbVariant().store(phase == 1 ? 1 : 0, std::memory_order_relaxed);
     swaps_left = 150;
@@ -4405,6 +4611,42 @@ void VulkanCommandProcessor::RovFsiAbOnSwap() {
   };
   compare("a1 vs a2 (frozen scene)", dumps[0], dumps[2]);
   compare("a1 vs b (variant)", dumps[0], dumps[1]);
+  // Guest memory written back by the GPU in the frame (resolves, memexport).
+  auto compare_guest = [&](const char* name, const std::vector<uint8_t>& x,
+                           const std::vector<uint8_t>& y) {
+    size_t different = 0;
+    std::string first;
+    if (x.size() != y.size()) {
+      report += fmt::format("{}: guest range sets differ ({} vs {} bytes)\n", name, x.size(),
+                            y.size());
+      return;
+    }
+    // Walk the (address, length, bytes) records.
+    size_t offset = 0;
+    while (offset + 8 <= x.size()) {
+      uint32_t address, length;
+      std::memcpy(&address, x.data() + offset, 4);
+      std::memcpy(&length, x.data() + offset + 4, 4);
+      for (uint32_t i = 0; i < length; ++i) {
+        if (x[offset + 8 + i] != y[offset + 8 + i]) {
+          if (++different <= 8) {
+            first += fmt::format("  guest 0x{:08X}: {:02X} -> {:02X}\n", address + i,
+                                 x[offset + 8 + i], y[offset + 8 + i]);
+          }
+        }
+      }
+      offset += 8 + length;
+    }
+    report += fmt::format("{}: {} different guest bytes of {}\n{}", name, different,
+                          x.size(), first);
+  };
+  compare_guest("guest a1 vs a2", guest_dumps[0], guest_dumps[2]);
+  compare_guest("guest a1 vs b", guest_dumps[0], guest_dumps[1]);
+  for (uint32_t i = 0; i < 3; ++i) {
+    std::ofstream file(dir / (std::string(kDumpNames[i]) + "_guest.bin"), std::ios::binary);
+    file.write(reinterpret_cast<const char*>(guest_dumps[i].data()),
+               std::streamsize(guest_dumps[i].size()));
+  }
   std::ofstream(dir / "report.txt") << report;
   REXGPU_INFO("FSI A/B report:\n{}", report);
 }
@@ -4450,6 +4692,11 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
         return false;
+      }
+      if (readback_tracker_ && readback.mapped_data[index] != nullptr) {
+        // Pending lazily read back data from the old buffer.
+        readback_tracker_->FlushSource(static_cast<const uint8_t*>(readback.mapped_data[index]),
+                                       readback.sizes[index]);
       }
       if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[index]);
@@ -4520,6 +4767,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   const uint8_t* readback_bytes =
       reinterpret_cast<const uint8_t*>(readback.mapped_data[read_index]);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    if (readback_tracker_) {
+      memory_->FlushPhysicalMemoryDataProviders(memexport_range.base_address_dwords << 2,
+                                                memexport_range.size_bytes);
+    }
     std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
@@ -4538,7 +4789,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode = GetEffectiveReadbackMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
@@ -4567,10 +4818,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode = GetEffectiveReadbackMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
+  RovAbRecordGpuWrittenRange(written_address, written_length);
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
@@ -4601,6 +4853,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
         return false;
+      }
+      if (readback_tracker_ && readback.mapped_data[index] != nullptr) {
+        // Pending lazily read back data from the old buffer.
+        readback_tracker_->FlushSource(static_cast<const uint8_t*>(readback.mapped_data[index]),
+                                       readback.sizes[index]);
       }
       if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[index]);
@@ -4797,6 +5054,20 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
+  if (readback_mode == ReadbackResolveMode::kLazy && readback_tracker_) {
+    // The guest memory gets the data when the CPU accesses it - the same data
+    // as the full readback, without waiting for the GPU here. The copy must be
+    // submitted before any other thread may wait for it.
+    uint64_t readback_submission = GetCurrentSubmission();
+    EndSubmission(false);
+    readback_tracker_->AddPendingRange(
+        written_address, written_length,
+        static_cast<const uint8_t*>(readback.mapped_data[write_index]),
+        reinterpret_cast<void*>(readback.memories[write_index]), readback_submission);
+    readback.current_index = 1 - readback.current_index;
+    return true;
+  }
+
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -4829,6 +5100,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
+      // Older lazily read back data must not overwrite this later.
+      if (readback_tracker_) {
+        memory_->FlushPhysicalMemoryDataProviders(written_address, written_length);
+      }
       std::memcpy(destination, readback.mapped_data[read_index], written_length);
     }
   }
@@ -4858,6 +5133,11 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
       continue;
     }
     for (uint32_t i = 0; i < 2; ++i) {
+      if (readback_tracker_ && readback.mapped_data[i]) {
+        // Pending lazily read back data from the evicted buffer.
+        readback_tracker_->FlushSource(static_cast<const uint8_t*>(readback.mapped_data[i]),
+                                       readback.sizes[i]);
+      }
       if (readback.mapped_data[i] && readback.memories[i] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[i]);
       }
@@ -5089,6 +5369,26 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
+}
+
+bool VulkanCommandProcessor::AwaitSubmissionFromAnyThread(uint64_t submission) const {
+  if (submission_timeline_semaphore_ == VK_NULL_HANDLE || !wait_semaphores_) {
+    return false;
+  }
+  VkSemaphoreWaitInfo wait_info = {};
+  wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+  wait_info.semaphoreCount = 1;
+  wait_info.pSemaphores = &submission_timeline_semaphore_;
+  wait_info.pValues = &submission;
+  // 10 seconds - only reached if the submission was never submitted (a bug).
+  VkResult result =
+      wait_semaphores_(GetVulkanDevice()->device(), &wait_info, UINT64_C(10000000000));
+  if (result != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to await Vulkan submission {} from another thread (result {})",
+                 submission, int32_t(result));
+    return false;
+  }
+  return true;
 }
 
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
@@ -5588,6 +5888,17 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     submit_info.pCommandBuffers = &command_buffer.buffer;
     submit_info.signalSemaphoreCount = 0;
     submit_info.pSignalSemaphores = nullptr;
+    // Signal the submission index on the timeline (AwaitSubmissionFromAnyThread).
+    const uint64_t timeline_signal_value = GetCurrentSubmission();
+    VkTimelineSemaphoreSubmitInfo timeline_submit_info = {};
+    if (submission_timeline_semaphore_ != VK_NULL_HANDLE) {
+      timeline_submit_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+      timeline_submit_info.signalSemaphoreValueCount = 1;
+      timeline_submit_info.pSignalSemaphoreValues = &timeline_signal_value;
+      submit_info.pNext = &timeline_submit_info;
+      submit_info.signalSemaphoreCount = 1;
+      submit_info.pSignalSemaphores = &submission_timeline_semaphore_;
+    }
     assert_false(fences_free_.empty());
     VkFence fence = fences_free_.back();
     if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {

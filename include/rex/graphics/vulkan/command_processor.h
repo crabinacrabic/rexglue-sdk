@@ -24,6 +24,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/readback_tracker.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -155,6 +156,13 @@ class VulkanCommandProcessor : public CommandProcessor {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  // Thread-safe: waits until an already submitted submission is completed by
+  // the GPU (needs the timeline semaphore). Returns false if not supported, on
+  // timeout or on device loss.
+  bool AwaitSubmissionFromAnyThread(uint64_t submission) const;
+  bool CanAwaitSubmissionFromAnyThread() const {
+    return submission_timeline_semaphore_ != VK_NULL_HANDLE;
+  }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -428,10 +436,24 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  // readback_resolve = "lazy": the memexported ranges are copied to a readback
+  // buffer and handed to readback_tracker_.
+  bool IssueDraw_MemexportReadbackLazyPath(uint32_t total_size);
+  // Logs the lazy readback counters (REX_VK_SYNC_STATS=1).
+  void LogReadbackTrackerStats();
   // ROV research (REX_VK_FSI_AB=<dir>): the in-run exactness check of the FSI
   // research variant, driven from IssueSwap.
   void RovFsiAbOnSwap();
   bool RovDumpEdram(std::vector<uint32_t>& dwords_out);
+  // The readback mode, toggled by the A/B check with REX_VK_AB_READBACK=1
+  // (full for the reference, lazy for the research variant).
+  ReadbackResolveMode GetEffectiveReadbackMode() const;
+  // Guest ranges the GPU wrote back in the current frame (A/B check only).
+  void RovAbRecordGpuWrittenRange(uint32_t physical_address, uint32_t length);
+  // The current guest memory contents of those ranges (after making the
+  // lazily read back data current): address, length, bytes for each.
+  void RovDumpGuestRanges(std::vector<uint8_t>& bytes_out);
+  std::vector<std::pair<uint32_t, uint32_t>> rov_ab_frame_ranges_;
 
   void SplitPendingBarrier();
 
@@ -524,6 +546,12 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::vector<VkFence> fences_free_;
   std::vector<VkSemaphore> semaphores_free_;
+  // Signaled with the submission index by every submission (if the device
+  // supports timeline semaphores).
+  VkSemaphore submission_timeline_semaphore_ = VK_NULL_HANDLE;
+  PFN_vkWaitSemaphores wait_semaphores_ = nullptr;
+  // Pending lazily read back GPU data (readback_resolve = "lazy").
+  std::unique_ptr<ReadbackTracker> readback_tracker_;
 
   bool submission_open_ = false;
   uint64_t submission_completed_ = 0;

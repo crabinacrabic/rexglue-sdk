@@ -50,8 +50,10 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " none: Disable readback (default)\n"
                       " fast: Read previous frame (delayed, copy every frame)\n"
                       " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " full: Immediate sync readback (accurate but stalls)\n"
+                      " lazy: The same data as full, copied when the CPU accesses it\n"
+                      "       (Vulkan; no stall unless the CPU reads unfinished GPU work)")
+    .allowed({"none", "fast", "some", "full", "lazy"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
@@ -95,6 +97,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   if (value == "full") {
     return ReadbackResolveMode::kFull;
+  }
+  if (value == "lazy") {
+    return ReadbackResolveMode::kLazy;
   }
   return ReadbackResolveMode::kDisabled;
 }

@@ -199,6 +199,8 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    // ROV research: requested only with REX_VK_DUMP_ISA (shader disassembly).
+    bool ext_AMD_shader_info = false;  // #43
   };
 
   const Extensions& extensions() const { return extensions_; }

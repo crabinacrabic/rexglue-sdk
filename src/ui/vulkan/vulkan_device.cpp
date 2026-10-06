@@ -192,6 +192,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #238.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
   }
+  // ROV research: REX_VK_DUMP_ISA=<dir> writes the ISA of the pipelines.
+  if (const char* dump_isa = std::getenv("REX_VK_DUMP_ISA"); dump_isa && *dump_isa) {
+    // #43.
+    XE_UI_VULKAN_STRUCT_EXTENSION(AMD_shader_info)
+  }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // #414.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_maintenance4, 1, 3)

@@ -1051,6 +1051,11 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.fsi_rt0_blend =
         RovKnownBlendIndex(regs[reg::RB_BLENDCONTROL::rt_register_indices[0]] & 0x1FFF1FFF);
   }
+  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
+      RovShortSectionDebug()) {
+    modification.pixel.fsi_short_section = 1;
+    modification.pixel.fsi_batch_loads = uint32_t(RovBatchLoadsDebug());
+  }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
@@ -3773,6 +3778,53 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       REXGPU_INFO("TESSDBG {}: tessellated pipeline created (vs={:016X}, patch_cp={})", tess_debug,
                   creation_arguments.vertex_shader->shader().ucode_data_hash(),
                   creation_arguments.tessellation_patch_control_points);
+    }
+  }
+  // ROV research: REX_VK_DUMP_ISA=<dir> writes the fragment shader ISA of each
+  // distinct FSI pixel shader modification (VK_AMD_shader_info).
+  if (edram_fragment_shader_interlock && !creating_placeholder && creation_arguments.pixel_shader &&
+      vulkan_device->extensions().ext_AMD_shader_info) {
+    static const char* dump_isa_dir = std::getenv("REX_VK_DUMP_ISA");
+    static const auto get_shader_info = PFN_vkGetShaderInfoAMD(
+        vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(device,
+                                                                          "vkGetShaderInfoAMD"));
+    static std::mutex isa_mutex;
+    static std::set<std::pair<uint64_t, uint64_t>> isa_dumped;
+    const uint64_t ps_hash = creation_arguments.pixel_shader->shader().ucode_data_hash();
+    const uint64_t ps_modification = creation_arguments.pixel_shader->modification();
+    std::lock_guard isa_lock(isa_mutex);
+    if (dump_isa_dir && get_shader_info &&
+        isa_dumped.insert(std::make_pair(ps_hash, ps_modification)).second) {
+      std::string text;
+      VkShaderStatisticsInfoAMD statistics = {};
+      size_t statistics_size = sizeof(statistics);
+      if (get_shader_info(device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT,
+                          VK_SHADER_INFO_TYPE_STATISTICS_AMD, &statistics_size,
+                          &statistics) == VK_SUCCESS) {
+        text += fmt::format("; vgprs={} sgprs={} lds={} scratch={}\n",
+                            statistics.resourceUsage.numUsedVgprs,
+                            statistics.resourceUsage.numUsedSgprs,
+                            statistics.resourceUsage.ldsUsageSizeInBytes,
+                            statistics.resourceUsage.scratchMemUsageInBytes);
+      }
+      size_t disassembly_size = 0;
+      if (get_shader_info(device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT,
+                          VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &disassembly_size,
+                          nullptr) == VK_SUCCESS &&
+          disassembly_size) {
+        std::string disassembly(disassembly_size, '\0');
+        if (get_shader_info(device, pipeline, VK_SHADER_STAGE_FRAGMENT_BIT,
+                            VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &disassembly_size,
+                            disassembly.data()) == VK_SUCCESS) {
+          disassembly.resize(std::strlen(disassembly.c_str()));
+          text += disassembly;
+        }
+      }
+      std::error_code ec;
+      std::filesystem::create_directories(dump_isa_dir, ec);
+      WriteDebugFile(std::filesystem::path(dump_isa_dir) /
+                         fmt::format("ps_{:016X}_{:016X}.isa.txt", ps_hash, ps_modification),
+                     text.data(), text.size());
     }
   }
   bool was_placeholder =

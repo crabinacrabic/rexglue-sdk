@@ -1055,6 +1055,7 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       RovShortSectionDebug()) {
     modification.pixel.fsi_short_section = 1;
     modification.pixel.fsi_batch_loads = uint32_t(RovBatchLoadsDebug());
+    modification.pixel.fsi_early_reject = uint32_t(RovEarlyRejectDebug());
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

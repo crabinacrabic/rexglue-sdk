@@ -861,6 +861,64 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     fsi_rt_0_dest_may_alias = builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                     fsi_rt_0_dest_may_alias, rt_0.dest_needed);
   }
+  // ROV research (REX_VK_FSI_EARLY_REJECT), NOT EXACT: an unordered read of the
+  // depth before the ordered section; if no covered sample passes the depth
+  // test against it, the pixel skips the section. Measures the potential of
+  // the exact (monotonic depth only) early rejection.
+  if (fsi_short_section && GetSpirvShaderModification().pixel.fsi_early_reject) {
+    const FsiDepthStencilPrepared& ds = fsi_depth_stencil_prepared;
+    spv::Id reject_possible = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_, ds.depth_stencil_enabled,
+        builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, ds.stencil_enabled));
+    spv::Id mask_before = main_fsi_sample_mask_;
+    SpirvBuilder::IfBuilder if_reject_possible(reject_possible,
+                                               spv::SelectionControlDontFlattenMask, *builder_);
+    spv::Id any_passed = builder_->makeBoolConstant(false);
+    spv::Id sample_0_address = FSI_AsInt(ds.sample_address[0]);
+    for (uint32_t i = 0; i < 4; ++i) {
+      spv::Id sample_covered = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, mask_before,
+                                builder_->makeUintConstant(uint32_t(1) << i)),
+          const_uint_0_);
+      spv::Id address = i ? builder_->createTriOp(spv::OpSelect, type_int_, sample_covered,
+                                                  FSI_AsInt(ds.sample_address[i]), sample_0_address)
+                          : sample_0_address;
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(address);
+      spv::Id old_depth = builder_->createBinOp(
+          spv::OpShiftRightLogical, type_uint_,
+          builder_->createLoad(
+              builder_->createAccessChain(features_.spirv_version >= spv::Spv_1_3
+                                              ? spv::StorageClassStorageBuffer
+                                              : spv::StorageClassUniform,
+                                          buffer_edram_, id_vector_temp_),
+              spv::NoPrecision),
+          builder_->makeUintConstant(8));
+      spv::Id depth24 = ds.sample_depth24[i];
+      spv::Id passed = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_, ds.depth_pass_if_less,
+          builder_->createBinOp(spv::OpULessThan, type_bool_, depth24, old_depth));
+      passed = builder_->createBinOp(
+          spv::OpLogicalOr, type_bool_, passed,
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, ds.depth_pass_if_equal,
+                                builder_->createBinOp(spv::OpIEqual, type_bool_, depth24, old_depth)));
+      passed = builder_->createBinOp(
+          spv::OpLogicalOr, type_bool_, passed,
+          builder_->createBinOp(
+              spv::OpLogicalAnd, type_bool_, ds.depth_pass_if_greater,
+              builder_->createBinOp(spv::OpUGreaterThan, type_bool_, depth24, old_depth)));
+      any_passed = builder_->createBinOp(
+          spv::OpLogicalOr, type_bool_, any_passed,
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, sample_covered, passed));
+    }
+    spv::Id mask_after =
+        builder_->createTriOp(spv::OpSelect, type_uint_, any_passed, mask_before, const_uint_0_);
+    if_reject_possible.makeEndIf();
+    main_fsi_sample_mask_ = if_reject_possible.createMergePhi(mask_after, mask_before);
+    fsi_pixel_potentially_killed = true;
+  }
 
   spv::Block* block_fsi_if_after_kill = nullptr;
   spv::Block* block_fsi_if_after_kill_merge = nullptr;
@@ -2912,6 +2970,16 @@ SpirvShaderTranslator::FsiColorPrepared SpirvShaderTranslator::FSI_ColorPrepare(
           builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                       id_vector_temp_),
           spv::NoPrecision));
+  // ROV research: REX_VK_FSI_AB_SABOTAGE=1 darkens the color of the research
+  // variant on purpose - the negative control of the REX_VK_FSI_AB check.
+  static const bool ab_sabotage = [] {
+    const char* env = std::getenv("REX_VK_FSI_AB_SABOTAGE");
+    return env && *env == '1';
+  }();
+  if (ab_sabotage) {
+    color = builder_->createNoContractionBinOp(spv::OpVectorTimesScalar, type_float4_, color,
+                                               builder_->makeFloatConstant(0.75f));
+  }
   prepared.color = color;
 
   spv::Id rt_uint2_index_array = builder_->makeIntConstant(color_target_index >> 1);

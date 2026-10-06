@@ -102,6 +102,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // ROV research (REX_VK_FSI_BATCH), with fsi_short_section: the EDRAM
       // loads of all samples are issued together.
       uint32_t fsi_batch_loads : 1;
+      // ROV research (REX_VK_FSI_EARLY_REJECT), not exact: unordered early
+      // depth rejection before the ordered section.
+      uint32_t fsi_early_reject : 1;
     } pixel;
     uint64_t value = 0;
 

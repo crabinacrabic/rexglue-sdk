@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -72,6 +74,9 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// ROV research (REX_VK_SYNC_STATS): the module base for return addresses.
+extern "C" char __ImageBase;
 
 namespace rex::graphics::vulkan {
 
@@ -5113,9 +5118,42 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    // ROV research: REX_VK_SYNC_STATS=1 logs, every 5 s, how long the command
+    // processor thread was blocked on the GPU and from where (module-relative
+    // return addresses, resolve with llvm-symbolizer and the PDB).
+    static const bool sync_stats = [] {
+      const char* env = std::getenv("REX_VK_SYNC_STATS");
+      return env && *env == '1';
+    }();
+    const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    if (sync_stats) {
+      struct SyncSite {
+        uint32_t count = 0;
+        double ms = 0.0;
+      };
+      static std::map<uintptr_t, SyncSite> sites;
+      static auto report_since = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      SyncSite& site = sites[uintptr_t(__builtin_return_address(0)) - uintptr_t(&__ImageBase)];
+      ++site.count;
+      site.ms += std::chrono::duration<double, std::milli>(now - wait_start).count();
+      const double window = std::chrono::duration<double>(now - report_since).count();
+      if (window >= 5.0) {
+        std::string report;
+        double total_ms = 0.0;
+        for (const auto& [rva, s] : sites) {
+          total_ms += s.ms;
+          report += fmt::format(" [rva 0x{:X}: {} waits, {:.0f} ms]", rva, s.count, s.ms);
+        }
+        REXGPU_INFO("VK sync: blocked {:.0f} ms of {:.1f} s ({:.0f}%):{}", total_ms, window,
+                    total_ms / (window * 10.0), report);
+        sites.clear();
+        report_since = now;
+      }
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {

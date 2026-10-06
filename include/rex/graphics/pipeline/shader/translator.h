@@ -138,6 +138,19 @@ inline bool RovBatchLoadsDebug() {
   return RovShortSectionDebug() && env_value;
 }
 
+// ROV research, NOT EXACT - only to measure the potential of a conservative
+// early depth rejection (M4): REX_VK_FSI_EARLY_REJECT=1 (with
+// REX_VK_FSI_SHORT=1) reads the depth before the ordered section (unordered)
+// and skips the section if no covered sample passes the depth test against it
+// (only without stencil).
+inline bool RovEarlyRejectDebug() {
+  static const bool env_value = [] {
+    const char* env = std::getenv("REX_VK_FSI_EARLY_REJECT");
+    return env && *env == '1';
+  }();
+  return RovShortSectionDebug() && env_value;
+}
+
 class ShaderTranslator {
  public:
   virtual ~ShaderTranslator();

@@ -96,6 +96,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t fsi_rt0_format : 4;
       uint32_t fsi_rt1_format : 4;
       uint32_t fsi_rt0_blend : 3;
+      // ROV research (REX_VK_FSI_SHORT), late FSI only: the EDRAM-independent
+      // part of the epilogue is done before the ordered section.
+      uint32_t fsi_short_section : 1;
+      // ROV research (REX_VK_FSI_BATCH), with fsi_short_section: the EDRAM
+      // loads of all samples are issued together.
+      uint32_t fsi_batch_loads : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -729,6 +735,85 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Updates main_fsi_sample_mask_. Must be called outside non-uniform control
   // flow because of taking derivatives of the fragment depth.
   void FSI_DepthStencilTest(spv::Id msaa_samples, bool sample_mask_potentially_narrowed_previouly);
+  // ROV research (REX_VK_FSI_SHORT, late depth / stencil only): the depth /
+  // stencil test and the color writes split into the EDRAM-independent part,
+  // emitted before OpBeginInvocationInterlockEXT on the outermost control flow
+  // level, and the EDRAM read-modify-write inside the ordered section. The math
+  // is the same as in FSI_DepthStencilTest and the color part of
+  // CompleteFragmentShaderInMain.
+  struct FsiDepthStencilPrepared {
+    spv::Id depth_stencil_enabled;
+    spv::Id depth_pass_if_less;
+    spv::Id depth_pass_if_equal;
+    spv::Id depth_pass_if_greater;
+    spv::Id depth_write;
+    spv::Id stencil_enabled;
+    spv::Id stencil_reference;
+    spv::Id stencil_read_mask;
+    spv::Id stencil_reference_read_masked;
+    spv::Id stencil_write_mask;
+    spv::Id stencil_write_keep_mask;
+    spv::Id stencil_func_ops;
+    spv::Id stencil_pass_if_less;
+    spv::Id stencil_pass_if_equal;
+    spv::Id stencil_pass_if_greater;
+    std::array<spv::Id, 4> sample_address;
+    std::array<spv::Id, 4> sample_depth24;
+  };
+  FsiDepthStencilPrepared FSI_DepthStencilPrepare(spv::Id msaa_samples);
+  // Updates main_fsi_sample_mask_. With batch_loads, the depth / stencil of
+  // all samples is loaded before testing any of them.
+  void FSI_DepthStencilTestPrepared(const FsiDepthStencilPrepared& prepared,
+                                    bool sample_mask_potentially_narrowed_previouly,
+                                    bool batch_loads);
+  struct FsiColorPrepared {
+    spv::Id color;
+    std::array<spv::Id, 2> keep_mask;
+    std::array<spv::Id, 2> replace_mask;
+    spv::Id write_mask_not_empty;
+    spv::Id format_with_flags;
+    spv::Id is_64bpp;
+    std::array<spv::Id, 4> sample_address;
+    spv::Id blend_enabled;
+    // Blending.
+    spv::Id color_is_fixed_point;
+    spv::Id alpha_is_fixed_point;
+    spv::Id clamp_color_min;
+    spv::Id clamp_alpha_min;
+    spv::Id clamp_color_max;
+    spv::Id clamp_alpha_max;
+    spv::Id color_source_factor;
+    spv::Id color_equation;
+    spv::Id color_dest_factor;
+    spv::Id alpha_source_factor;
+    spv::Id alpha_equation;
+    spv::Id alpha_dest_factor;
+    spv::Id blend_constant_color_clamped;
+    spv::Id blend_constant_alpha_clamped;
+    spv::Id source_color_clamped;
+    spv::Id source_alpha_clamped;
+    // Not blending.
+    std::array<spv::Id, 2> color_packed;
+    std::array<spv::Id, 2> color_packed_masked;
+    spv::Id keep_mask_not_empty;
+    // Whether the destination color is read (blending or a partial write mask).
+    spv::Id dest_needed;
+  };
+  FsiColorPrepared FSI_ColorPrepare(uint32_t color_target_index);
+  // The destination color of 4 samples, low and high 32 bits (0 for 32bpp).
+  using FsiColorDest = std::array<std::array<spv::Id, 2>, 4>;
+  // Loads the destination color at the sample addresses if `condition`, zeros
+  // otherwise.
+  FsiColorDest FSI_ColorLoadDest(const FsiColorPrepared& prepared,
+                                 const std::array<spv::Id, 4>& sample_addresses,
+                                 spv::Id condition);
+  // With dest_loaded, uses it instead of loading the destination color.
+  void FSI_ColorWritePrepared(uint32_t color_target_index, const FsiColorPrepared& prepared,
+                              spv::Id color_targets_written,
+                              const std::array<spv::Id, 4>& samples_covered,
+                              const FsiColorDest* dest_loaded);
+  spv::Id FSI_AsInt(spv::Id value);
+  spv::Id FSI_AsUint(spv::Id value);
   // Returns the first and the second 32 bits as two uints.
   std::array<spv::Id, 2> FSI_ClampAndPackColor(spv::Id color_float4, spv::Id format_with_flags);
   std::array<spv::Id, 4> FSI_UnpackColor(std::array<spv::Id, 2> color_packed,

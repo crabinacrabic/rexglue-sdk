@@ -12,9 +12,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -2289,6 +2293,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  RovFsiAbOnSwap();
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
@@ -4259,6 +4265,143 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
   dfn.vkFreeMemory(device, readback_memory, nullptr);
   return true;
+}
+
+bool VulkanCommandProcessor::RovDumpEdram(std::vector<uint32_t>& dwords_out) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const VkDeviceSize size = render_target_cache_->EdramBufferSizeForResearch();
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  uint32_t readback_memory_type = UINT32_MAX;
+  VkDeviceSize readback_memory_size = 0;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory,
+          &readback_memory_type, &readback_memory_size)) {
+    return false;
+  }
+  render_target_cache_->CopyEdramBufferForResearch(readback_buffer);
+  PushBufferMemoryBarrier(readback_buffer, 0, size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  bool dumped = false;
+  void* readback_mapping = nullptr;
+  if (AwaitAllQueueOperationsCompletion() &&
+      dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &readback_mapping) ==
+          VK_SUCCESS) {
+    if (!(vulkan_device->memory_types().host_coherent & (uint32_t(1) << readback_memory_type))) {
+      VkMappedMemoryRange readback_memory_range = {};
+      readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      readback_memory_range.memory = readback_memory;
+      readback_memory_range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
+    }
+    dwords_out.resize(size_t(size / sizeof(uint32_t)));
+    std::memcpy(dwords_out.data(), readback_mapping, size_t(size));
+    dfn.vkUnmapMemory(device, readback_memory);
+    dumped = true;
+  }
+  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+  dfn.vkFreeMemory(device, readback_memory, nullptr);
+  // Resume the frame (the wait has ended the submission).
+  BeginSubmission(true);
+  return dumped;
+}
+
+void VulkanCommandProcessor::RovFsiAbOnSwap() {
+  // Exactness check of REX_VK_FSI_SHORT in one run on a frozen scene: when the
+  // file <dir>/go appears, dump the EDRAM with the reference variant (a1),
+  // switch to the research variant and dump again (b), switch back and dump
+  // once more (a2). a1 == a2 shows that the scene is frozen, a1 == b that the
+  // variant is exact. Frames drawn with placeholder pipelines are skipped.
+  static const char* const ab_dir = std::getenv("REX_VK_FSI_AB");
+  if (!ab_dir || !*ab_dir ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock) {
+    return;
+  }
+  static uint32_t phase = 0, swaps_left = 0, idle_swaps = 0;
+  static std::vector<uint32_t> dumps[3];
+  static const char* const kDumpNames[3] = {"a1", "b", "a2"};
+  const std::filesystem::path dir(ab_dir);
+  if (!phase) {
+    if (++idle_swaps % 30) {
+      return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::remove(dir / "go", ec)) {
+      return;
+    }
+    RovAbVariant().store(0, std::memory_order_relaxed);
+    phase = 1;
+    swaps_left = 30;
+    REXGPU_INFO("FSI A/B: started");
+    return;
+  }
+  if (swaps_left) {
+    --swaps_left;
+    return;
+  }
+  if (frame_used_async_placeholder_pipeline_) {
+    return;
+  }
+  const uint32_t dump_index = phase - 1;
+  if (!RovDumpEdram(dumps[dump_index])) {
+    REXGPU_ERROR("FSI A/B: EDRAM dump {} failed", kDumpNames[dump_index]);
+    RovAbVariant().store(-1, std::memory_order_relaxed);
+    phase = 0;
+    return;
+  }
+  REXGPU_INFO("FSI A/B: dumped {}", kDumpNames[dump_index]);
+  if (phase < 3) {
+    RovAbVariant().store(phase == 1 ? 1 : 0, std::memory_order_relaxed);
+    swaps_left = 150;
+    ++phase;
+    return;
+  }
+  RovAbVariant().store(-1, std::memory_order_relaxed);
+  phase = 0;
+
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  for (uint32_t i = 0; i < 3; ++i) {
+    std::ofstream file(dir / (std::string(kDumpNames[i]) + ".bin"), std::ios::binary);
+    file.write(reinterpret_cast<const char*>(dumps[i].data()),
+               std::streamsize(dumps[i].size() * sizeof(uint32_t)));
+  }
+  // EDRAM dword index -> tile and sample position in the tile (32bpp layout).
+  const uint32_t tile_width =
+      xenos::kEdramTileWidthSamples * render_target_cache_->draw_resolution_scale_x();
+  const uint32_t tile_dwords =
+      tile_width * xenos::kEdramTileHeightSamples * render_target_cache_->draw_resolution_scale_y();
+  std::string report;
+  auto compare = [&](const char* name, const std::vector<uint32_t>& x,
+                     const std::vector<uint32_t>& y) {
+    size_t different = 0;
+    std::set<uint32_t> tiles;
+    std::string first;
+    for (size_t i = 0; i < std::min(x.size(), y.size()); ++i) {
+      if (x[i] == y[i]) {
+        continue;
+      }
+      ++different;
+      tiles.insert(uint32_t(i / tile_dwords));
+      if (different <= 16) {
+        uint32_t in_tile = uint32_t(i % tile_dwords);
+        first += fmt::format("  dword {} tile {} x {} y {}: {:08X} -> {:08X}\n", i,
+                             i / tile_dwords, in_tile % tile_width, in_tile / tile_width, x[i],
+                             y[i]);
+      }
+    }
+    report += fmt::format("{}: {} different dwords in {} tiles\n{}", name, different,
+                         tiles.size(), first);
+  };
+  compare("a1 vs a2 (frozen scene)", dumps[0], dumps[2]);
+  compare("a1 vs b (variant)", dumps[0], dumps[1]);
+  std::ofstream(dir / "report.txt") << report;
+  REXGPU_INFO("FSI A/B report:\n{}", report);
 }
 
 bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_size) {

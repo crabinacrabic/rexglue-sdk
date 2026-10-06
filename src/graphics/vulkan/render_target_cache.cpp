@@ -2149,6 +2149,15 @@ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
   edram_buffer_usage_ = new_usage;
 }
 
+void VulkanRenderTargetCache::CopyEdramBufferForResearch(VkBuffer dst_buffer) {
+  UseEdramBuffer(EdramBufferUsage::kTransferRead);
+  command_processor_.SubmitBarriers(true);
+  VkBufferCopy region = {};
+  region.size = EdramBufferSizeForResearch();
+  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(edram_buffer_, dst_buffer, 1,
+                                                               &region);
+}
+
 void VulkanRenderTargetCache::MarkEdramBufferModified(
     EdramBufferModificationStatus modification_status) {
   assert_true(modification_status != EdramBufferModificationStatus::kUnmodified);

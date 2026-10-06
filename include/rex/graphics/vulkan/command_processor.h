@@ -428,6 +428,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  // ROV research (REX_VK_FSI_AB=<dir>): the in-run exactness check of the FSI
+  // research variant, driven from IssueSwap.
+  void RovFsiAbOnSwap();
+  bool RovDumpEdram(std::vector<uint32_t>& dwords_out);
 
   void SplitPendingBarrier();
 

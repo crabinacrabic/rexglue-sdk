@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
@@ -104,6 +105,37 @@ inline bool RovHoistDebug() {
     return env && *env == '1';
   }();
   return value;
+}
+
+// ROV research (REX_VK_FSI_AB): the variant forced by the in-run exactness
+// check: -1 when not forcing, 0 for the reference (the REX_VK_FSI_* research
+// switches off), 1 for the research variant (the switches as set).
+inline std::atomic<int>& RovAbVariant() {
+  static std::atomic<int> variant{-1};
+  return variant;
+}
+
+// ROV research: REX_VK_FSI_SHORT=1 (with REX_ROV_LATE_DEPTH=1) builds the
+// Vulkan FSI epilogue with a short ordered section - everything that doesn't
+// read the EDRAM is done before OpBeginInvocationInterlockEXT.
+inline bool RovShortSectionDebug() {
+  static const bool env_value = [] {
+    const char* env = std::getenv("REX_VK_FSI_SHORT");
+    return env && *env == '1';
+  }();
+  return RovLateDepthDebug() && env_value &&
+         RovAbVariant().load(std::memory_order_relaxed) != 0;
+}
+
+// ROV research: REX_VK_FSI_BATCH=1 (with REX_VK_FSI_SHORT=1) issues the EDRAM
+// loads of all samples (depth / stencil and render target 0) at the beginning
+// of the ordered section, so it waits for the memory once, not per sample.
+inline bool RovBatchLoadsDebug() {
+  static const bool env_value = [] {
+    const char* env = std::getenv("REX_VK_FSI_BATCH");
+    return env && *env == '1';
+  }();
+  return RovShortSectionDebug() && env_value;
 }
 
 class ShaderTranslator {

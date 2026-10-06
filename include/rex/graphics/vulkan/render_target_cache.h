@@ -102,6 +102,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkBuffer edram_buffer() const { return edram_buffer_; }
 
+  // ROV research (REX_VK_FSI_AB): records a copy of the whole EDRAM buffer
+  // (EdramBufferSizeForResearch bytes) to a transfer destination buffer.
+  VkDeviceSize EdramBufferSizeForResearch() const {
+    return VkDeviceSize(xenos::kEdramSizeBytes *
+                        (draw_resolution_scale_x() * draw_resolution_scale_y()));
+  }
+  void CopyEdramBufferForResearch(VkBuffer dst_buffer);
+
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.

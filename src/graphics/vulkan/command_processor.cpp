@@ -5426,9 +5426,17 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
       return env && *env == '1';
     }();
     const auto wait_start = std::chrono::steady_clock::now();
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    // In chunks: the AMD Windows driver fails (VK_ERROR_UNKNOWN) a wait for
+    // more than about 64 fences, and lazy readback ends a submission per
+    // resolve, so a frame can span ~100 submissions (VP1 save-and-quit).
+    constexpr uint32_t kMaxFencesPerWait = 32;
+    const uint32_t fences_to_await = uint32_t(await_submission - submission_completed_);
+    VkResult wait_result = VK_SUCCESS;
+    for (uint32_t i = 0; i < fences_to_await && wait_result == VK_SUCCESS; i += kMaxFencesPerWait) {
+      wait_result = dfn.vkWaitForFences(device, std::min(kMaxFencesPerWait, fences_to_await - i),
+                                        submissions_in_flight_fences_.data() + i, VK_TRUE,
+                                        UINT64_MAX);
+    }
     if (sync_stats) {
       struct SyncSite {
         uint32_t count = 0;
@@ -5457,7 +5465,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR(
+          "Failed to await submission completion Vulkan fences (result {}, await {}, completed {}, "
+          "in flight {}, current {})",
+          int(wait_result), await_submission, submission_completed_,
+          submissions_in_flight_fences_.size(), GetCurrentSubmission());
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
       }

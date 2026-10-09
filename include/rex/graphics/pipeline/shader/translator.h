@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/registers.h>
@@ -28,15 +29,26 @@
 
 namespace rex::graphics {
 
+// The exact ROV / FSI speedups are on with the edram_interlock_optimizations
+// setting; the research environment variable of each part, if set ("0" or
+// "1"), overrides it. Returns -1 if the variable is not set.
+inline int RovEnvOverride(const char* name) {
+  const char* env = std::getenv(name);
+  if (!env || !*env) {
+    return -1;
+  }
+  return *env - '0';
+}
+inline bool RovSwitch(int env_override) {
+  return env_override >= 0 ? env_override != 0 : REXCVAR_GET(edram_interlock_optimizations);
+}
+
 // ROV research: REX_ROV_LATE_DEPTH=1 forces the late (end of shader) EDRAM
 // depth / stencil test in the ROV and FSI paths, so the ordered section only
 // covers the tail of the pixel shader.
 inline bool RovLateDepthDebug() {
-  static const bool value = [] {
-    const char* env = std::getenv("REX_ROV_LATE_DEPTH");
-    return env && *env == '1';
-  }();
-  return value;
+  static const int env_override = RovEnvOverride("REX_ROV_LATE_DEPTH");
+  return RovSwitch(env_override);
 }
 
 // ROV research: REX_ROV_SAMPLE_RATE=1 runs the D3D12 ROV pixel shader at sample
@@ -70,11 +82,8 @@ inline uint32_t RovPadDebug() {
 // in the pixel shader modification, so the ROV EDRAM code uses literal format
 // flags instead of the system constant and the driver folds the format switches.
 inline bool RovKnownFormatsDebug() {
-  static const bool value = [] {
-    const char* env = std::getenv("REX_ROV_KNOWN_FORMATS");
-    return env && *env == '1';
-  }();
-  return value;
+  static const int env_override = RovEnvOverride("REX_ROV_KNOWN_FORMATS");
+  return RovSwitch(env_override);
 }
 
 // ROV research (REX_ROV_KNOWN_FORMATS): frequent RB_BLENDCONTROL & 0x1FFF1FFF
@@ -119,11 +128,8 @@ inline std::atomic<int>& RovAbVariant() {
 // Vulkan FSI epilogue with a short ordered section - everything that doesn't
 // read the EDRAM is done before OpBeginInvocationInterlockEXT.
 inline bool RovShortSectionDebug() {
-  static const bool env_value = [] {
-    const char* env = std::getenv("REX_VK_FSI_SHORT");
-    return env && *env == '1';
-  }();
-  return RovLateDepthDebug() && env_value &&
+  static const int env_override = RovEnvOverride("REX_VK_FSI_SHORT");
+  return RovLateDepthDebug() && RovSwitch(env_override) &&
          RovAbVariant().load(std::memory_order_relaxed) != 0;
 }
 
@@ -131,25 +137,30 @@ inline bool RovShortSectionDebug() {
 // loads of all samples (depth / stencil and render target 0) at the beginning
 // of the ordered section, so it waits for the memory once, not per sample.
 inline bool RovBatchLoadsDebug() {
-  static const bool env_value = [] {
-    const char* env = std::getenv("REX_VK_FSI_BATCH");
-    return env && *env == '1';
-  }();
-  return RovShortSectionDebug() && env_value;
+  static const int env_override = RovEnvOverride("REX_VK_FSI_BATCH");
+  return RovShortSectionDebug() && RovSwitch(env_override);
 }
 
-// ROV research, NOT EXACT - only to measure the potential of a conservative
-// early depth rejection (M4): REX_VK_FSI_EARLY_REJECT=1 (with
-// REX_VK_FSI_SHORT=1) reads the depth before the ordered section (unordered)
-// and skips the section if no covered sample passes the depth test against it
-// (only without stencil).
-inline bool RovEarlyRejectDebug() {
-  static const bool env_value = [] {
-    const char* env = std::getenv("REX_VK_FSI_EARLY_REJECT");
-    return env && *env == '1';
-  }();
-  return RovShortSectionDebug() && env_value;
+// ROV research (M4): REX_VK_FSI_EARLY_REJECT (with REX_VK_FSI_SHORT=1) reads
+// the depth before the ordered section (unordered, possibly stale) and skips
+// the section if no covered sample passes the depth test against it (only
+// without stencil). The shader code is in the pixel shader modification; the
+// command processor enables it per draw with a system constant flag:
+// 1 - exact: only while the stored depth is monotonic since the last EDRAM
+//     barrier (VulkanCommandProcessor::UpdateFsiEarlyDepthReject);
+// 2 - NOT EXACT, for measurements and as a negative control: for every draw
+//     with a less / greater depth test and no stencil.
+inline int RovEarlyRejectMode() {
+  static const int env_override = RovEnvOverride("REX_VK_FSI_EARLY_REJECT");
+  if (!RovShortSectionDebug()) {
+    return 0;
+  }
+  if (env_override >= 0) {
+    return env_override <= 2 ? env_override : 0;
+  }
+  return REXCVAR_GET(edram_interlock_optimizations) ? 1 : 0;
 }
+inline bool RovEarlyRejectDebug() { return RovEarlyRejectMode() != 0; }
 
 class ShaderTranslator {
  public:

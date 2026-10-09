@@ -171,6 +171,12 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // ROV research (M4): after Update with the pixel shader interlock path,
+  // whether a color render target of the draw may write into the EDRAM range
+  // of its depth buffer (then the stored depth isn't only written by depth
+  // tests until the next barrier).
+  bool interlock_color_may_overlap_depth() const { return interlock_color_may_overlap_depth_; }
+
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -665,6 +671,7 @@ class RenderTargetCache {
   // update. 0 is depth, color starting from 1, nullptr if not bound.
   // Only valid for non-pixel-shader-interlock paths.
   RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  bool interlock_color_may_overlap_depth_ = false;
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which

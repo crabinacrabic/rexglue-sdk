@@ -168,6 +168,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // taking into account the potential relation with occlusion queries (but
     // should be safe at least temporarily).
     kSysFlag_FSIDepthStencilEarlyWrite_Shift,
+    // ROV research (M4): the shader may skip the ordered section if no covered
+    // sample passes the depth test against the depth read before it (set by
+    // the command processor only when that is exact for the draw). Ignored if
+    // the pixel shader modification doesn't contain the early rejection.
+    kSysFlag_FSIEarlyDepthReject_Shift,
 
     kSysFlag_Count,
 
@@ -216,6 +221,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSysFlag_FSIDepthWrite = 1u << kSysFlag_FSIDepthWrite_Shift,
     kSysFlag_FSIStencilTest = 1u << kSysFlag_FSIStencilTest_Shift,
     kSysFlag_FSIDepthStencilEarlyWrite = 1u << kSysFlag_FSIDepthStencilEarlyWrite_Shift,
+    kSysFlag_FSIEarlyDepthReject = 1u << kSysFlag_FSIEarlyDepthReject_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

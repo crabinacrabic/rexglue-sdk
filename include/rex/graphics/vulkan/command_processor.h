@@ -553,6 +553,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Pending lazily read back GPU data (readback_resolve = "lazy").
   std::unique_ptr<ReadbackTracker> readback_tracker_;
 
+  // ROV research (M4, REX_VK_FSI_EARLY_REJECT): whether the FSI early depth
+  // rejection may be used for the current draw (kSysFlag_FSIEarlyDepthReject).
+  // Called after the render target cache update of the draw.
+  bool UpdateFsiEarlyDepthReject(reg::RB_DEPTHCONTROL normalized_depth_control);
+  // REX_VK_DEPTH_STATS=1: logs the depth state of the FSI draws every 5 s.
+  void LogFsiDepthStats(reg::RB_DEPTHCONTROL normalized_depth_control, bool early_reject);
+  bool fsi_early_depth_reject_ = false;
+  uint64_t fsi_early_reject_epoch_ = UINT64_MAX;
+  // Since the last EDRAM barrier, every draw wrote depth only in a way that
+  // can't increase (decreasing) / decrease (increasing) the stored value.
+  bool fsi_early_reject_depth_decreasing_ = true;
+  bool fsi_early_reject_depth_increasing_ = true;
+
   bool submission_open_ = false;
   uint64_t submission_completed_ = 0;
   // In case vkQueueSubmit fails after something like a successful

@@ -4023,6 +4023,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  // ROV research (M4): after the render target cache update, which may have
+  // placed a barrier on the EDRAM buffer.
+  fsi_early_depth_reject_ = UpdateFsiEarlyDepthReject(normalized_depth_control);
+
   // Update system constants before uploading them.
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
@@ -6363,6 +6367,125 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // VK_EXT_extended_dynamic_state2.
 }
 
+bool VulkanCommandProcessor::UpdateFsiEarlyDepthReject(
+    reg::RB_DEPTHCONTROL normalized_depth_control) {
+  // Exactness: the render target cache places a barrier on the EDRAM buffer
+  // before a draw uses EDRAM tiles written since the last barrier as another
+  // render target (RenderTargetCache::Update, ownership ranges) - so between
+  // two barriers (an "epoch") a depth dword is written only by the depth /
+  // stencil tests of the same depth buffer (same base, pitch, MSAA; the format
+  // may change, but both unorm24 and float24 are compared as unsigned 24-bit
+  // integers, which keep their order), and the depth part changes only when a
+  // depth write passes the test.
+  // If every draw of the epoch so far can write depth only with LESS / LEQUAL
+  // / EQUAL (or NEVER), the stored depth never increases. A read of it before
+  // the ordered section (possibly stale, but not older than the epoch, since
+  // the barrier also invalidates the caches) is then not lower than the value
+  // the section will see; a LESS / LEQUAL draw failing against it for every
+  // covered sample also fails against the current value, and with stencil
+  // disabled a failed sample writes nothing. The mirror case is GREATER /
+  // GEQUAL with non-decreasing depth. Later draws can't affect the read: their
+  // ordered sections for the same sample wait for this one.
+  // The epoch state is tracked for every draw, even while the rejection is
+  // off (the A/B check switches it on in the middle of an epoch).
+  if (render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock) {
+    return false;
+  }
+  const int mode = RovEarlyRejectMode();
+  const uint64_t epoch = render_target_cache_->edram_barrier_epoch();
+  if (epoch != fsi_early_reject_epoch_) {
+    fsi_early_reject_epoch_ = epoch;
+    fsi_early_reject_depth_decreasing_ = true;
+    fsi_early_reject_depth_increasing_ = true;
+  }
+  // A color render target of this draw may write into the depth buffer's EDRAM
+  // range (the render target cache only tracks truncated ranges): the stored
+  // depth isn't monotonic anymore until the next barrier.
+  if (render_target_cache_->interlock_color_may_overlap_depth()) {
+    fsi_early_reject_depth_decreasing_ = false;
+    fsi_early_reject_depth_increasing_ = false;
+  }
+  const xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
+  if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) {
+    switch (zfunc) {
+      case xenos::CompareFunction::kNever:
+      case xenos::CompareFunction::kEqual:
+        break;
+      case xenos::CompareFunction::kLess:
+      case xenos::CompareFunction::kLessEqual:
+        fsi_early_reject_depth_increasing_ = false;
+        break;
+      case xenos::CompareFunction::kGreater:
+      case xenos::CompareFunction::kGreaterEqual:
+        fsi_early_reject_depth_decreasing_ = false;
+        break;
+      default:
+        fsi_early_reject_depth_decreasing_ = false;
+        fsi_early_reject_depth_increasing_ = false;
+        break;
+    }
+  }
+  bool allowed = false;
+  if (mode && normalized_depth_control.z_enable && !normalized_depth_control.stencil_enable) {
+    switch (zfunc) {
+      case xenos::CompareFunction::kLess:
+      case xenos::CompareFunction::kLessEqual:
+        allowed = mode == 2 || fsi_early_reject_depth_decreasing_;
+        break;
+      case xenos::CompareFunction::kGreater:
+      case xenos::CompareFunction::kGreaterEqual:
+        allowed = mode == 2 || fsi_early_reject_depth_increasing_;
+        break;
+      default:
+        break;
+    }
+  }
+  LogFsiDepthStats(normalized_depth_control, allowed);
+  return allowed;
+}
+
+void VulkanCommandProcessor::LogFsiDepthStats(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                              bool early_reject) {
+  static const bool enabled = [] {
+    const char* env = std::getenv("REX_VK_DEPTH_STATS");
+    return env && *env == '1';
+  }();
+  if (!enabled) {
+    return;
+  }
+  static uint64_t draws = 0, depth_draws = 0, write_draws = 0, stencil_draws = 0, rejectable = 0;
+  static uint64_t func_draws[8] = {};
+  static uint64_t epochs = 0, last_epoch = UINT64_MAX;
+  static auto since = std::chrono::steady_clock::now();
+  ++draws;
+  if (normalized_depth_control.z_enable) {
+    ++depth_draws;
+    ++func_draws[uint32_t(normalized_depth_control.zfunc) & 7];
+    write_draws += normalized_depth_control.z_write_enable;
+  }
+  stencil_draws += normalized_depth_control.stencil_enable;
+  rejectable += early_reject;
+  if (fsi_early_reject_epoch_ != last_epoch) {
+    last_epoch = fsi_early_reject_epoch_;
+    ++epochs;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const double window = std::chrono::duration<double>(now - since).count();
+  if (window < 5.0) {
+    return;
+  }
+  REXGPU_INFO(
+      "FSI depth over {:.1f} s: {} draws, {} EDRAM epochs; depth test {} (write {}), stencil {}; "
+      "func never/less/equal/lequal/greater/notequal/gequal/always {}/{}/{}/{}/{}/{}/{}/{}; "
+      "early reject allowed {} ({:.0f}%)",
+      window, draws, epochs, depth_draws, write_draws, stencil_draws, func_draws[0], func_draws[1],
+      func_draws[2], func_draws[3], func_draws[4], func_draws[5], func_draws[6], func_draws[7],
+      rejectable, draws ? 100.0 * double(rejectable) / double(draws) : 0.0);
+  draws = depth_draws = write_draws = stencil_draws = rejectable = epochs = 0;
+  std::fill(std::begin(func_draws), std::end(func_draws), uint64_t(0));
+  since = now;
+}
+
 void VulkanCommandProcessor::UpdateSystemConstantValues(
     bool primitive_polygonal,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -6547,6 +6670,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     if (alpha_test_function == xenos::CompareFunction::kAlways &&
         !rb_colorcontrol.alpha_to_mask_enable) {
       flags |= SpirvShaderTranslator::kSysFlag_FSIDepthStencilEarlyWrite;
+    }
+    if (fsi_early_depth_reject_) {
+      flags |= SpirvShaderTranslator::kSysFlag_FSIEarlyDepthReject;
     }
   }
   dirty |= system_constants_.flags != flags;

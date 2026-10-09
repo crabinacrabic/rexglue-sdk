@@ -408,6 +408,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   }
 
   bool fsi_pixel_potentially_killed = false;
+  // Whether the pixel may be demoted to a helper invocation (the demote
+  // capability is declared then).
+  bool fsi_pixel_potentially_demoted =
+      features_.demote_to_helper_invocation && current_shader().kills_pixels();
 
   if (current_shader().kills_pixels()) {
     if (edram_fragment_shader_interlock_) {
@@ -570,6 +574,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         if (edram_fragment_shader_interlock_) {
           assert_true(features_.demote_to_helper_invocation);
           fsi_pixel_potentially_killed = true;
+          fsi_pixel_potentially_demoted = true;
           // TODO(Triang3l): Promoted to SPIR-V 1.6 - don't add the extension
           // there.
           builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
@@ -861,15 +866,23 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     fsi_rt_0_dest_may_alias = builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                     fsi_rt_0_dest_may_alias, rt_0.dest_needed);
   }
-  // ROV research (REX_VK_FSI_EARLY_REJECT), NOT EXACT: an unordered read of the
-  // depth before the ordered section; if no covered sample passes the depth
-  // test against it, the pixel skips the section. Measures the potential of
-  // the exact (monotonic depth only) early rejection.
+  // ROV research (M4, REX_VK_FSI_EARLY_REJECT): an unordered read of the depth
+  // before the ordered section; if no covered sample passes the depth test
+  // against it, the pixel skips the section. Exact only when the stored depth
+  // is monotonic, which the command processor checks per draw and reports via
+  // kSysFlag_FSIEarlyDepthReject (see UpdateFsiEarlyDepthReject).
   if (fsi_short_section && GetSpirvShaderModification().pixel.fsi_early_reject) {
     const FsiDepthStencilPrepared& ds = fsi_depth_stencil_prepared;
     spv::Id reject_possible = builder_->createBinOp(
         spv::OpLogicalAnd, type_bool_, ds.depth_stencil_enabled,
         builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, ds.stencil_enabled));
+    reject_possible = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_, reject_possible,
+        builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                                  builder_->makeUintConstant(kSysFlag_FSIEarlyDepthReject)),
+            const_uint_0_));
     spv::Id mask_before = main_fsi_sample_mask_;
     SpirvBuilder::IfBuilder if_reject_possible(reject_possible,
                                                spv::SelectionControlDontFlattenMask, *builder_);
@@ -896,6 +909,16 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                           buffer_edram_, id_vector_temp_),
               spv::NoPrecision),
           builder_->makeUintConstant(8));
+      // REX_VK_FSI_EARLY_REJECT_SABOTAGE=1 (negative control of the A/B check):
+      // compare against half the stored depth, rejecting pixels that pass.
+      static const bool early_reject_sabotage = [] {
+        const char* env = std::getenv("REX_VK_FSI_EARLY_REJECT_SABOTAGE");
+        return env && *env == '1';
+      }();
+      if (early_reject_sabotage) {
+        old_depth = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, old_depth,
+                                          builder_->makeUintConstant(1));
+      }
       spv::Id depth24 = ds.sample_depth24[i];
       spv::Id passed = builder_->createBinOp(
           spv::OpLogicalAnd, type_bool_, ds.depth_pass_if_less,
@@ -928,7 +951,11 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
 
   if (edram_fragment_shader_interlock_) {
     if (fsi_pixel_potentially_killed) {
-      if (features_.demote_to_helper_invocation) {
+      // Only if the pixel may have been demoted (by a kill instruction or the
+      // alpha test), which declares the demote capability - not when it may
+      // only be skipped by alpha to coverage or the ROV research early depth
+      // rejection.
+      if (fsi_pixel_potentially_demoted) {
         // Don't do anything related to writing to the EDRAM if the pixel was
         // killed.
         id_vector_temp_.clear();

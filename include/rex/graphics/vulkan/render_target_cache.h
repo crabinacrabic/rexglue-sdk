@@ -110,6 +110,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   }
   void CopyEdramBufferForResearch(VkBuffer dst_buffer);
 
+  // ROV research (M4): incremented whenever a pipeline barrier on the EDRAM
+  // buffer is requested - all EDRAM writes recorded before it are complete
+  // and visible to everything recorded after it.
+  uint64_t edram_barrier_epoch() const { return edram_barrier_epoch_; }
+
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
@@ -266,6 +271,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
   EdramBufferUsage edram_buffer_usage_;
+  uint64_t edram_barrier_epoch_ = 0;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;

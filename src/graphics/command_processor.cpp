@@ -45,6 +45,15 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(edram_interlock_optimizations, false, "GPU",
+                    "Exact speedups of the EDRAM emulation via rasterizer-ordered views (D3D12) or\n"
+                    "fragment shader interlock (Vulkan): the depth / stencil test at the end of the\n"
+                    "pixel shader and the render target formats compiled into the shader; in Vulkan\n"
+                    "also a short ordered section with batched EDRAM loads and an early depth\n"
+                    "rejection where it is exact. The same picture, faster. Research environment\n"
+                    "variables (REX_ROV_*, REX_VK_FSI_*) override the parts.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"

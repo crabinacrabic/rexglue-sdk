@@ -402,6 +402,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  interlock_color_may_overlap_depth_ = false;
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -656,6 +657,27 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
                                        rt_base);
+  }
+
+  // ROV research (M4): whether a color render target of this draw may write
+  // into the EDRAM range of the depth buffer - the ranges above are truncated
+  // at the base of the next render target, but the shader writes are not.
+  if (interlock_barrier_only && (depth_and_color_rts_used_bits & 1)) {
+    auto ranges_intersect = [](uint32_t a, uint32_t a_length, uint32_t b, uint32_t b_length) {
+      if (a_length >= xenos::kEdramTileCount || b_length >= xenos::kEdramTileCount) {
+        return a_length && b_length;
+      }
+      return ((b + xenos::kEdramTileCount - a) % xenos::kEdramTileCount) < a_length ||
+             ((a + xenos::kEdramTileCount - b) % xenos::kEdramTileCount) < b_length;
+    };
+    for (uint32_t i = 1; i <= xenos::kMaxColorRenderTargets; ++i) {
+      if ((depth_and_color_rts_used_bits & (uint32_t(1) << i)) &&
+          ranges_intersect(edram_bases[i], length_used_tiles_at_32bpp << ((rts_are_64bpp >> i) & 1),
+                           edram_bases[0], length_used_tiles_at_32bpp)) {
+        interlock_color_may_overlap_depth_ = true;
+        break;
+      }
+    }
   }
 
   if (interlock_barrier_only) {

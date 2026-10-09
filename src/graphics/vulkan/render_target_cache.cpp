@@ -2145,6 +2145,7 @@ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
     // Resetting edram_buffer_modification_status_ only if the barrier has been
     // truly inserted.
     edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
+    ++edram_barrier_epoch_;
   }
   edram_buffer_usage_ = new_usage;
 }
@@ -2208,6 +2209,7 @@ void VulkanRenderTargetCache::CommitEdramBufferShaderWrites(
       edram_buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask, access_mask, access_mask,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
+  ++edram_barrier_epoch_;
   PixelShaderInterlockFullEdramBarrierPlaced();
 }
 

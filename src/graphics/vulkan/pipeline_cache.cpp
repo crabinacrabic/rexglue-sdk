@@ -1039,8 +1039,10 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_point = 0;
   }
 
+  // The A/B reference (variant 0) reads the formats from the system constants
+  // like the original shader; the modification bit keeps the pipelines apart.
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
-      RovKnownFormatsDebug()) {
+      RovKnownFormatsDebug() && RovAbVariant().load(std::memory_order_relaxed) != 0) {
     // ROV research (REX_ROV_KNOWN_FORMATS): the same values the command
     // processor puts into edram_rt_format_flags / edram_rt_blend_factors_ops.
     modification.pixel.fsi_rt_formats_known = 1;
@@ -1051,8 +1053,10 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.fsi_rt0_blend =
         RovKnownBlendIndex(regs[reg::RB_BLENDCONTROL::rt_register_indices[0]] & 0x1FFF1FFF);
   }
+  // The short section needs the late depth / stencil test, which goes with the
+  // known formats (SpirvShaderTranslator::FSI_IsDepthStencilEarly).
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
-      RovShortSectionDebug()) {
+      RovShortSectionDebug() && modification.pixel.fsi_rt_formats_known) {
     modification.pixel.fsi_short_section = 1;
     modification.pixel.fsi_batch_loads = uint32_t(RovBatchLoadsDebug());
     modification.pixel.fsi_early_reject = uint32_t(RovEarlyRejectDebug());

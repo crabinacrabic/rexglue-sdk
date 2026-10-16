@@ -117,8 +117,10 @@ inline bool RovHoistDebug() {
 }
 
 // ROV research (REX_VK_FSI_AB): the variant forced by the in-run exactness
-// check: -1 when not forcing, 0 for the reference (the REX_VK_FSI_* research
-// switches off), 1 for the research variant (the switches as set).
+// check: -1 when not forcing, 0 for the reference - the original shader (in
+// Vulkan the known formats off, and with them the late depth / stencil test
+// and the REX_VK_FSI_* parts), 1 for the research variant (the switches as
+// set).
 inline std::atomic<int>& RovAbVariant() {
   static std::atomic<int> variant{-1};
   return variant;

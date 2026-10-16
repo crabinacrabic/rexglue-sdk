@@ -4827,6 +4827,29 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
   RovAbRecordGpuWrittenRange(written_address, written_length);
+  // ROV research (REX_VK_AB_LOG_RESOLVES=1): the source of each resolve, once
+  // per destination and source, to map the A/B guest ranges to passes.
+  static const bool log_resolves = [] {
+    const char* env = std::getenv("REX_VK_AB_LOG_RESOLVES");
+    return env && *env == '1';
+  }();
+  if (log_resolves) {
+    static std::set<std::pair<uint32_t, uint32_t>> logged;
+    const RegisterFile& regs = *register_file_;
+    const uint32_t src = regs.Get<reg::RB_COPY_CONTROL>().copy_src_select;
+    const uint32_t src_info =
+        src >= xenos::kMaxColorRenderTargets
+            ? regs.Get<reg::RB_DEPTH_INFO>().value
+            : regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[src]).value;
+    if (logged.emplace(written_address, (src << 28) ^ src_info).second) {
+      REXGPU_INFO(
+          "A/B resolve: guest 0x{:08X} length {} <- {} {} info 0x{:08X} (surface 0x{:08X}, "
+          "dest info 0x{:08X})",
+          written_address, written_length, src >= xenos::kMaxColorRenderTargets ? "depth" : "RT",
+          src, src_info, regs.Get<reg::RB_SURFACE_INFO>().value,
+          regs.Get<reg::RB_COPY_DEST_INFO>().value);
+    }
+  }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&

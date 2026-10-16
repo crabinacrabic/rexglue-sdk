@@ -730,9 +730,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id LoadMsaaSamplesFromFlags();
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
+  // ROV research: the late test (REX_ROV_LATE_DEPTH) comes with the known
+  // render target formats here - there's no free modification bit for it, and
+  // so the pipelines without known formats (the A/B reference) are the
+  // original shader.
   bool FSI_IsDepthStencilEarly() const {
     assert_true(edram_fragment_shader_interlock_);
-    return !RovLateDepthDebug() && !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
+    return !(RovLateDepthDebug() && GetSpirvShaderModification().pixel.fsi_rt_formats_known) &&
+           !is_depth_only_fragment_shader_ && !current_shader().writes_depth() &&
            !current_shader().memexport_eM_written();
   }
   void FSI_LoadSampleMask(spv::Id msaa_samples);

@@ -27,6 +27,7 @@ AchievementToastDialog::~AchievementToastDialog() {}
 void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
   std::lock_guard<std::mutex> lock(mutex_);
   queue_.push_back({event, std::chrono::steady_clock::now()});
+  has_toasts_.store(true, std::memory_order_relaxed);
 }
 
 void AchievementToastDialog::OnDraw(ImGuiIO& io) {
@@ -47,6 +48,7 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
         break;
       }
     }
+    has_toasts_.store(!queue_.empty(), std::memory_order_relaxed);
     if (queue_.empty()) {
       return;
     }

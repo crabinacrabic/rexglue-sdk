@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -373,6 +374,25 @@ class Presenter {
 
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
+
+  // How evenly the host presentation shows the guest frames, for performance
+  // overlays. Collected by whichever thread paints, over windows of about one
+  // second; any thread may take the last complete window. The times are those
+  // of the present calls on the CPU, not of the scanout: with a vertical sync
+  // (FIFO) the present or the next image acquisition waits for the vertical
+  // blank, so they follow it closely. A guest frame consumed by
+  // CaptureGuestOutput between two paints is not counted.
+  struct PresentStats {
+    double window_seconds = 0.0;  // 0 until the first window is complete
+    uint32_t presents = 0;        // all presents, guest frames and UI repaints
+    uint32_t guest_frames = 0;    // presents that showed a new guest frame
+    // Intervals between the presents that showed new guest frames.
+    double guest_interval_avg_ms = 0.0;
+    double guest_interval_min_ms = 0.0;
+    double guest_interval_max_ms = 0.0;
+    double guest_interval_stddev_ms = 0.0;
+  };
+  PresentStats GetPresentStats() const;
 
  protected:
   enum class PaintResult {
@@ -994,6 +1014,26 @@ class Presenter {
   bool is_in_ui_thread_paint_ = false;
   bool request_guest_output_paint_after_current_ui_thread_paint_;
   bool request_ui_paint_after_current_ui_thread_paint_;
+
+  // GetPresentStats: the current window, accessed only by the thread that owns
+  // painting, and the last complete one, under the mutex.
+  void RecordPresentForStats(bool new_guest_frame);
+  struct PresentStatsWindow {
+    std::chrono::steady_clock::time_point start;
+    std::chrono::steady_clock::time_point last_guest_present;
+    bool started = false;
+    bool has_last_guest_present = false;
+    uint32_t presents = 0;
+    uint32_t guest_frames = 0;
+    uint32_t intervals = 0;
+    double interval_sum_ms = 0.0;
+    double interval_sum_sq_ms = 0.0;
+    double interval_min_ms = 0.0;
+    double interval_max_ms = 0.0;
+  };
+  PresentStatsWindow present_stats_window_;
+  mutable std::mutex present_stats_mutex_;
+  PresentStats present_stats_;
 
   // Platform-specific, but implementation-agnostic parts, primarily for
   // limiting of the frame rate of the UI to avoid drawing the UI at extreme

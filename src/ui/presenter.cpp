@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <utility>
 
 #include <rex/assert.h>
@@ -1494,10 +1496,79 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #endif  // XE_PLATFORM
 }
 
+Presenter::PresentStats Presenter::GetPresentStats() const {
+  std::lock_guard<std::mutex> lock(present_stats_mutex_);
+  return present_stats_;
+}
+
+void Presenter::RecordPresentForStats(bool new_guest_frame) {
+  const auto now = std::chrono::steady_clock::now();
+  PresentStatsWindow& window = present_stats_window_;
+  if (!window.started) {
+    window.started = true;
+    window.start = now;
+  }
+  ++window.presents;
+  if (new_guest_frame) {
+    ++window.guest_frames;
+    if (window.has_last_guest_present) {
+      const double interval_ms =
+          std::chrono::duration<double, std::milli>(now - window.last_guest_present).count();
+      window.interval_min_ms =
+          window.intervals ? std::min(window.interval_min_ms, interval_ms) : interval_ms;
+      window.interval_max_ms =
+          window.intervals ? std::max(window.interval_max_ms, interval_ms) : interval_ms;
+      window.interval_sum_ms += interval_ms;
+      window.interval_sum_sq_ms += interval_ms * interval_ms;
+      ++window.intervals;
+    }
+    window.last_guest_present = now;
+    window.has_last_guest_present = true;
+  }
+  const double window_seconds = std::chrono::duration<double>(now - window.start).count();
+  if (window_seconds < 1.0) {
+    return;
+  }
+  PresentStats stats;
+  stats.window_seconds = window_seconds;
+  stats.presents = window.presents;
+  stats.guest_frames = window.guest_frames;
+  if (window.intervals) {
+    const double avg = window.interval_sum_ms / window.intervals;
+    stats.guest_interval_avg_ms = avg;
+    stats.guest_interval_min_ms = window.interval_min_ms;
+    stats.guest_interval_max_ms = window.interval_max_ms;
+    stats.guest_interval_stddev_ms =
+        std::sqrt(std::max(window.interval_sum_sq_ms / window.intervals - avg * avg, 0.0));
+  }
+  {
+    std::lock_guard<std::mutex> lock(present_stats_mutex_);
+    present_stats_ = stats;
+  }
+  // Keep the last guest present, so the first interval of the next window is
+  // measured too.
+  const auto last_guest_present = window.last_guest_present;
+  const bool has_last_guest_present = window.has_last_guest_present;
+  window = PresentStatsWindow();
+  window.started = true;
+  window.start = now;
+  window.last_guest_present = last_guest_present;
+  window.has_last_guest_present = has_last_guest_present;
+}
+
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  // The painting implementation acquires the latest guest output image via
+  // ConsumeGuestOutput; the acquired mailbox index changes only when it's new.
+  const uint32_t acquired_before =
+      guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed) & 3;
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    RecordPresentForStats(
+        (guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed) & 3) !=
+        acquired_before);
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

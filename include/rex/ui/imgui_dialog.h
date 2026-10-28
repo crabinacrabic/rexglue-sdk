@@ -39,6 +39,15 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the UI must be repainted continuously while this dialog exists
+  // (input and animation at the display rate). A dialog that only shows
+  // information, or is hidden, can return false: it is then drawn with every
+  // paint that happens anyway, such as each new guest frame, so the host
+  // presents once per guest frame instead of at the display rate, which with
+  // vertical sync and a busy GPU makes the guest frames uneven. The drawer
+  // repaints continuously if any dialog needs it.
+  virtual bool NeedsContinuousRepaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

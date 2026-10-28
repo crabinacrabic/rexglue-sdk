@@ -1,3 +1,15 @@
+<p align="center"><img src="docs/images/red-edition-vulkan/logo.png" width="560" alt="RED Edition Vulkan logo: a red volcano over the glowing mantle"></p>
+
+> [!NOTE]
+> **This is RED Edition Vulkan**, a research fork of ReXGlue SDK (branch [`rov-research`](https://github.com/crabinacrabic/rexglue-sdk/tree/rov-research)). It makes the exact Xbox 360 EDRAM emulation (the Vulkan fragment shader interlock path) fast enough to play on AMD Radeon: Viva Piñata went from 13–15 to 30 game ticks per second on an RX 6600, with the EDRAM identical to the original shader. Red is for Radeon, the GPU it was tuned on; the volcano and its mantle are for Vulkan, which grew out of AMD's Mantle.
+>
+> - What changed and how exactness is checked: [docs/accurate-edram-vulkan.md](docs/accurate-edram-vulkan.md).
+> - To use it: `render_target_path_vulkan = "fsi"`, `readback_resolve = "lazy"`, `edram_interlock_optimizations = true`. `CommandProcessor::render_target_path()` tells a game whether the exact path really runs (it falls back on GPUs without interlock), and `Presenter::GetPresentStats()` shows how evenly frames reach the screen.
+> - Windows builds: [releases](https://github.com/crabinacrabic/rexglue-sdk/releases). The game it was developed with: [Viva Piñata Recomp](https://github.com/crabinacrabic/VivaPinataRecomp) (launcher mode "Accurate").
+> - Upstream discussion: [rexglue/rexglue-sdk#520](https://github.com/rexglue/rexglue-sdk/issues/520), the AMD fence bug [rexglue/rexglue-sdk#521](https://github.com/rexglue/rexglue-sdk/issues/521). Tested only on AMD RDNA2 so far; reports from NVIDIA and Intel GPUs are welcome.
+>
+> <sub>A community fork, not affiliated with AMD or the Khronos Group. Vulkan is a registered trademark of the Khronos Group Inc.; Radeon is a trademark of Advanced Micro Devices, Inc. Everything below is the upstream README.</sub>
+
 > [!CAUTION]
 > This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
 

@@ -199,6 +199,9 @@ bool D3D12RenderTargetCache::Initialize() {
 #endif
   }
   if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
+    REXGPU_WARN(
+        "D3D12: rasterizer-ordered views are not supported; using host render targets, which "
+        "don't emulate the EDRAM exactly");
     path_ = Path::kHostRenderTargets;
   }
 

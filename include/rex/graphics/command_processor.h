@@ -94,6 +94,20 @@ class CommandProcessor {
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
 
+  // The render target path the backend actually uses. It differs from the
+  // render_target_path_* setting when the device doesn't support that path
+  // (no fragment shader interlock / rasterizer-ordered views). kUnknown until
+  // the command processor thread has set up its context. Any thread may read
+  // it, for example to show the user whether the EDRAM is emulated exactly.
+  enum class RenderTargetPath : uint8_t {
+    kUnknown,
+    kHostRenderTargets,
+    kPixelShaderInterlock,
+  };
+  RenderTargetPath render_target_path() const {
+    return render_target_path_.load(std::memory_order_acquire);
+  }
+
   virtual bool Initialize();
   virtual void Shutdown();
 
@@ -280,6 +294,9 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+
+  // Set by backend command processors when the render target cache is set up.
+  std::atomic<RenderTargetPath> render_target_path_{RenderTargetPath::kUnknown};
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

@@ -940,6 +940,11 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
+  render_target_path_.store(
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock
+          ? RenderTargetPath::kPixelShaderInterlock
+          : RenderTargetPath::kHostRenderTargets,
+      std::memory_order_release);
 
   // Initialize resource binding.
   constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
@@ -1734,6 +1739,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   constant_buffer_pool_.reset();
 
   render_target_cache_.reset();
+  render_target_path_.store(RenderTargetPath::kUnknown, std::memory_order_release);
 
   shared_memory_.reset();
 

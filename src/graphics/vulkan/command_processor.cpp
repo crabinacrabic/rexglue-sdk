@@ -1015,6 +1015,11 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
+  render_target_path_.store(
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock
+          ? RenderTargetPath::kPixelShaderInterlock
+          : RenderTargetPath::kHostRenderTargets,
+      std::memory_order_release);
 
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
@@ -2074,6 +2079,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   pipeline_cache_.reset();
 
   render_target_cache_.reset();
+  render_target_path_.store(RenderTargetPath::kUnknown, std::memory_order_release);
 
   primitive_processor_.reset();
 

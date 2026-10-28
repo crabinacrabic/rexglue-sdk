@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <tuple>
@@ -206,6 +207,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       device_properties.fragmentStoresAndAtomics && device_properties.sampleRateShading &&
       device_properties.standardSampleLocations &&
       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers;
+  // Research: REX_VK_DISABLE_FSI=1 treats fragment shader interlock as
+  // unsupported, to test the fallback on a device that has it.
+  const char* disable_fsi_env = std::getenv("REX_VK_DISABLE_FSI");
+  const bool fsi_disabled_by_env = disable_fsi_env && disable_fsi_env[0] && disable_fsi_env[0] != '0';
+  if (fsi_disabled_by_env) {
+    fsi_path_supported = false;
+  }
   if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
     path_ = Path::kPixelShaderInterlock;
   } else {
@@ -234,6 +242,18 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // shaders, and the usage of fragment shader interlock, prefer the former
     // for simplicity.
     if (!fsi_path_supported) {
+      REXGPU_WARN(
+          "Vulkan: the fragment shader interlock render target path is not supported{} "
+          "(interlock: sample {}, pixel {}; fragmentStoresAndAtomics {}, sampleRateShading {}, "
+          "standardSampleLocations {}, storage buffers per stage {} of {} needed); using host "
+          "render targets, which don't emulate the EDRAM exactly",
+          fsi_disabled_by_env ? " (disabled by REX_VK_DISABLE_FSI)" : "",
+          bool(device_properties.fragmentShaderSampleInterlock),
+          bool(device_properties.fragmentShaderPixelInterlock),
+          bool(device_properties.fragmentStoresAndAtomics),
+          bool(device_properties.sampleRateShading),
+          bool(device_properties.standardSampleLocations),
+          device_properties.maxPerStageDescriptorStorageBuffers, shared_memory_binding_count + 1);
       path_ = Path::kHostRenderTargets;
     }
   }
